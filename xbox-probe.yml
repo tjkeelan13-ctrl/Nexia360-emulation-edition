@@ -1,0 +1,499 @@
+# Self-contained first test for Xbox Developer Mode. NOT a Nexia port.
+# Add only this file at .github/workflows/xbox-probe.yml in your fork.
+name: Xbox - Native Diagnostic (not emulator)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [Mousehook]
+    paths:
+      - '.github/workflows/xbox-probe.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: xbox-native-probe-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+      - name: Write standalone diagnostic sources (does not build Nexia)
+        shell: python
+        run: |
+          from pathlib import Path
+          root = Path("xbox-probe")
+          root.mkdir(exist_ok=True)
+          (root / 'Probe.cpp').write_text(r'''// Standalone UWP diagnostic. No Nexia or game runtime is linked into this app.
+          #define WIN32_LEAN_AND_MEAN
+          #define NOMINMAX
+          #include <windows.h>
+          #include <d3d11.h>
+          #include <dxgi1_2.h>
+          #include <d2d1_1.h>
+          #include <dwrite.h>
+          #include <winrt/Windows.ApplicationModel.h>
+          #include <winrt/Windows.ApplicationModel.Activation.h>
+          #include <winrt/Windows.ApplicationModel.Core.h>
+          #include <winrt/Windows.Foundation.h>
+          #include <winrt/Windows.Foundation.Collections.h>
+          #include <winrt/Windows.Gaming.Input.h>
+          #include <winrt/Windows.Storage.h>
+          #include <winrt/Windows.System.Profile.h>
+          #include <winrt/Windows.UI.Core.h>
+          #include <cstring>
+          #include <sstream>
+          #include <string>
+
+          using namespace winrt;
+          using namespace Windows::ApplicationModel::Core;
+          using namespace Windows::UI::Core;
+          using namespace Windows::Gaming::Input;
+
+          namespace {
+          std::wstring log_path;
+          void Log(const std::string& message) noexcept {
+            try {
+              if (log_path.empty()) return;
+              HANDLE file = CreateFile2(log_path.c_str(), FILE_APPEND_DATA,
+                                       FILE_SHARE_READ, OPEN_ALWAYS, nullptr);
+              if (file == INVALID_HANDLE_VALUE) return;
+              const std::string line = message + "\r\n";
+              DWORD written = 0;
+              WriteFile(file, line.data(), static_cast<DWORD>(line.size()), &written, nullptr);
+              CloseHandle(file);
+            } catch (...) {}
+          }
+
+          bool StorageTest(const std::wstring& folder) {
+            const auto path = folder + L"\\probe-save.txt";
+            HANDLE file = CreateFile2(path.c_str(), GENERIC_READ | GENERIC_WRITE,
+                                     FILE_SHARE_READ, CREATE_ALWAYS, nullptr);
+            if (file == INVALID_HANDLE_VALUE) {
+              Log("Storage open failed: " + std::to_string(GetLastError()));
+              return false;
+            }
+            constexpr char data[] = "Nexia Xbox diagnostic: local storage round trip\r\n";
+            char readback[sizeof(data)]{};
+            DWORD written = 0, read = 0;
+            const DWORD length = static_cast<DWORD>(sizeof(data) - 1);
+            const LARGE_INTEGER start{};
+            const bool ok = WriteFile(file, data, length, &written, nullptr) &&
+                            written == length && FlushFileBuffers(file) &&
+                            SetFilePointerEx(file, start, nullptr, FILE_BEGIN) &&
+                            ReadFile(file, readback, length, &read, nullptr) &&
+                            read == length && std::memcmp(data, readback, length) == 0;
+            const DWORD error = ok ? ERROR_SUCCESS : GetLastError();
+            CloseHandle(file);
+            Log(ok ? "Storage write/read: PASS" :
+                     "Storage write/read: FAIL; last Win32 error=" + std::to_string(error));
+            return ok;
+          }
+
+          struct Probe : implements<Probe, IFrameworkViewSource, IFrameworkView> {
+            CoreWindow window{nullptr};
+            bool closed = false, visible = true, storage_ok = false;
+            std::wstring folder, family;
+            uint32_t last_pad_count = UINT32_MAX;
+            GamepadButtons previous = GamepadButtons::None;
+            unsigned save_tests = 0;
+            D3D_FEATURE_LEVEL feature{};
+            com_ptr<ID3D11Device> device;
+            com_ptr<ID3D11DeviceContext> device_context;
+            com_ptr<IDXGISwapChain1> swap;
+            com_ptr<ID2D1DeviceContext> canvas;
+            com_ptr<ID2D1SolidColorBrush> brush;
+            com_ptr<IDWriteTextFormat> text_format;
+
+            IFrameworkView CreateView() { return *this; }
+            void Initialize(CoreApplicationView const& view) {
+              folder = Windows::Storage::ApplicationData::Current().LocalFolder().Path().c_str();
+              log_path = folder + L"\\probe-log.txt";
+              HANDLE file = CreateFile2(log_path.c_str(), GENERIC_WRITE,
+                                       FILE_SHARE_READ, CREATE_ALWAYS, nullptr);
+              if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
+              Log("Nexia Xbox Probe 0.1 - native diagnostic ONLY; no XBLIG support");
+              family = Windows::System::Profile::AnalyticsInfo::VersionInfo().DeviceFamily().c_str();
+              Log("Device family: " + to_string(family));
+              storage_ok = StorageTest(folder);
+              ++save_tests;
+              view.Activated([](auto const&, auto const&) {
+                CoreWindow::GetForCurrentThread().Activate();
+              });
+              CoreApplication::Suspending([](auto const&, auto const&) { Log("Suspending"); });
+              CoreApplication::Resuming([](auto const&, auto const&) { Log("Resuming"); });
+            }
+
+            void SetWindow(CoreWindow const& value) {
+              window = value;
+              window.Closed([this](auto const&, auto const&) { closed = true; });
+              window.VisibilityChanged([this](auto const&, VisibilityChangedEventArgs const& e) {
+                visible = e.Visible();
+              });
+              constexpr D3D_FEATURE_LEVEL levels[] = {
+                  D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0,
+                  D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0};
+              check_hresult(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
+                  D3D11_CREATE_DEVICE_BGRA_SUPPORT, levels, ARRAYSIZE(levels),
+                  D3D11_SDK_VERSION, device.put(), &feature, device_context.put()));
+              Log("D3D11 hardware device: PASS; feature level=" +
+                  std::to_string(static_cast<unsigned>(feature)));
+              auto dxgi_device = device.as<IDXGIDevice>();
+              com_ptr<IDXGIAdapter> adapter;
+              check_hresult(dxgi_device->GetAdapter(adapter.put()));
+              com_ptr<IDXGIFactory2> factory;
+              check_hresult(adapter->GetParent(__uuidof(IDXGIFactory2), factory.put_void()));
+              DXGI_SWAP_CHAIN_DESC1 desc{};
+              desc.Width = 1280; desc.Height = 720;
+              desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+              desc.SampleDesc.Count = 1;
+              desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+              desc.BufferCount = 2;
+              desc.Scaling = DXGI_SCALING_STRETCH;
+              desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+              desc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+              auto window_unknown = window.as<::IUnknown>();
+              check_hresult(factory->CreateSwapChainForCoreWindow(device.get(),
+                  window_unknown.get(), &desc, nullptr, swap.put()));
+              com_ptr<ID2D1Factory1> d2d_factory;
+              check_hresult(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED,
+                  __uuidof(ID2D1Factory1), nullptr, d2d_factory.put_void()));
+              com_ptr<ID2D1Device> d2d_device;
+              check_hresult(d2d_factory->CreateDevice(dxgi_device.get(), d2d_device.put()));
+              check_hresult(d2d_device->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE,
+                                                           canvas.put()));
+              com_ptr<IDXGISurface> surface;
+              check_hresult(swap->GetBuffer(0, __uuidof(IDXGISurface), surface.put_void()));
+              const auto properties = D2D1::BitmapProperties1(
+                  D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+                  D2D1::PixelFormat(desc.Format, D2D1_ALPHA_MODE_IGNORE), 96.0f, 96.0f);
+              com_ptr<ID2D1Bitmap1> bitmap;
+              check_hresult(canvas->CreateBitmapFromDxgiSurface(surface.get(), &properties,
+                                                               bitmap.put()));
+              canvas->SetTarget(bitmap.get());
+              check_hresult(canvas->CreateSolidColorBrush(D2D1::ColorF(D2D1::ColorF::White),
+                                                          brush.put()));
+              com_ptr<IDWriteFactory> write_factory;
+              check_hresult(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED,
+                  __uuidof(IDWriteFactory), reinterpret_cast<::IUnknown**>(write_factory.put())));
+              check_hresult(write_factory->CreateTextFormat(L"Segoe UI", nullptr,
+                  DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+                  DWRITE_FONT_STRETCH_NORMAL, 27.0f, L"en-US", text_format.put()));
+              Log("CoreWindow swap chain + Direct2D text setup: PASS");
+            }
+
+            void Load(hstring const&) {}
+            void Run() {
+              bool first_frame = true;
+              while (!closed) {
+                window.Dispatcher().ProcessEvents(visible ? CoreProcessEventsOption::ProcessAllIfPresent
+                    : CoreProcessEventsOption::ProcessOneAndAllPending);
+                if (closed || !visible) continue;
+                auto pads = Gamepad::Gamepads();
+                const auto count = pads.Size();
+                if (count != last_pad_count) {
+                  Log("Connected gamepads: " + std::to_string(count));
+                  last_pad_count = count;
+                  previous = GamepadButtons::None;
+                }
+                GamepadReading reading{};
+                if (count) reading = pads.GetAt(0).GetCurrentReading();
+                if ((reading.Buttons & GamepadButtons::A) != GamepadButtons::None &&
+                    (previous & GamepadButtons::A) == GamepadButtons::None) {
+                  storage_ok = StorageTest(folder);
+                  ++save_tests;
+                }
+                previous = reading.Buttons;
+                std::wostringstream text;
+                text << L"NEXIA XBOX PROBE - diagnostic only\n\n"
+                     << L"This is NOT the emulator. It cannot launch CastleMiner Z yet.\n\n"
+                     << L"Device family: " << family << L"\n"
+                     << L"D3D11 hardware + native UWP rendering: initialized\n"
+                     << L"Storage write/read: " << (storage_ok ? L"PASS" : L"FAIL")
+                     << L"   |   Test count: " << save_tests << L"\n"
+                     << L"Controllers connected: " << count << L"\n"
+                     << L"Buttons: " << static_cast<uint32_t>(reading.Buttons) << L"\n"
+                     << L"Left stick: " << reading.LeftThumbstickX << L", "
+                     << reading.LeftThumbstickY << L"\n\n"
+                     << L"Press A to repeat the save-file test. Move the left stick.\n"
+                     << L"Take a photo of this screen to report the result.\n"
+                     << L"Log: app LocalState / probe-log.txt";
+                const auto display = text.str();
+                canvas->BeginDraw();
+                canvas->Clear(D2D1::ColorF(0.035f, 0.055f, 0.085f));
+                canvas->DrawText(display.c_str(), static_cast<UINT32>(display.size()),
+                    text_format.get(), D2D1::RectF(64.0f, 52.0f, 1216.0f, 668.0f), brush.get());
+                check_hresult(canvas->EndDraw());
+                check_hresult(swap->Present(1, 0));
+                if (first_frame) { Log("First frame presented: PASS"); first_frame = false; }
+              }
+              Log("Normal close");
+            }
+            void Uninitialize() {}
+          };
+          } // namespace
+
+          int __stdcall wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
+            try {
+              init_apartment(apartment_type::multi_threaded);
+              CoreApplication::Run(make<Probe>());
+              return 0;
+            } catch (hresult_error const& e) {
+              std::ostringstream error;
+              error << "FATAL HRESULT 0x" << std::hex << static_cast<uint32_t>(e.code().value)
+                    << ": " << to_string(e.message());
+              Log(error.str());
+            } catch (std::exception const& e) { Log(std::string("FATAL: ") + e.what()); }
+              catch (...) { Log("FATAL: unknown native exception"); }
+            return 1;
+          }
+          ''', encoding="utf-8")
+          (root / 'Probe.vcxproj').write_text(r'''<?xml version="1.0" encoding="utf-8"?>
+          <Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+            <ItemGroup Label="ProjectConfigurations">
+              <ProjectConfiguration Include="Release|x64"><Configuration>Release</Configuration><Platform>x64</Platform></ProjectConfiguration>
+            </ItemGroup>
+            <PropertyGroup Label="Globals">
+              <ProjectGuid>{A16E9B2B-58BB-4A59-92E8-07496F195B2A}</ProjectGuid>
+              <RootNamespace>NexiaXboxProbe</RootNamespace>
+              <DefaultLanguage>en-US</DefaultLanguage>
+              <MinimumVisualStudioVersion>17.0</MinimumVisualStudioVersion>
+              <ApplicationType>Windows Store</ApplicationType>
+              <ApplicationTypeRevision>10.0</ApplicationTypeRevision>
+              <AppContainerApplication>true</AppContainerApplication>
+              <WindowsTargetPlatformVersion Condition="'$(WindowsTargetPlatformVersion)'==''">10.0.19041.0</WindowsTargetPlatformVersion>
+              <WindowsTargetPlatformMinVersion>10.0.17763.0</WindowsTargetPlatformMinVersion>
+              <AppxPackage>false</AppxPackage>
+              <AppxPackageSigningEnabled>false</AppxPackageSigningEnabled>
+              <GenerateAppxPackageOnBuild>false</GenerateAppxPackageOnBuild>
+            </PropertyGroup>
+            <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+            <PropertyGroup Label="Configuration">
+              <ConfigurationType>Application</ConfigurationType>
+              <UseDebugLibraries>false</UseDebugLibraries>
+              <PlatformToolset>v143</PlatformToolset>
+              <CharacterSet>Unicode</CharacterSet>
+            </PropertyGroup>
+            <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+            <PropertyGroup>
+              <OutDir>$(MSBuildThisFileDirectory)bin\</OutDir>
+              <IntDir>$(MSBuildThisFileDirectory)obj\</IntDir>
+              <TargetName>NexiaXboxProbe</TargetName>
+              <GenerateManifest>false</GenerateManifest>
+            </PropertyGroup>
+            <ItemDefinitionGroup>
+              <ClCompile>
+                <LanguageStandard>stdcpp17</LanguageStandard>
+                <CompileAsWinRT>false</CompileAsWinRT>
+                <PrecompiledHeader>NotUsing</PrecompiledHeader>
+                <ExceptionHandling>Sync</ExceptionHandling>
+                <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
+                <WarningLevel>Level4</WarningLevel>
+                <Optimization>MaxSpeed</Optimization>
+                <PreprocessorDefinitions>WINAPI_FAMILY=WINAPI_FAMILY_APP;_WIN32_WINNT=0x0A00;WINVER=0x0A00;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+              </ClCompile>
+              <Link>
+                <SubSystem>Windows</SubSystem>
+                <GenerateWindowsMetadata>false</GenerateWindowsMetadata>
+                <AdditionalDependencies>windowsapp.lib;d3d11.lib;dxgi.lib;d2d1.lib;dwrite.lib;%(AdditionalDependencies)</AdditionalDependencies>
+              </Link>
+            </ItemDefinitionGroup>
+            <ItemGroup><ClCompile Include="Probe.cpp" /></ItemGroup>
+            <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+          </Project>
+          ''', encoding="utf-8")
+          (root / 'build.ps1').write_text(r'''param([ValidateRange(1,65535)][int]$BuildNumber = 1)
+          $ErrorActionPreference = 'Stop'
+          Set-StrictMode -Version Latest
+          $root = $PSScriptRoot
+          $out = Join-Path $root 'out'
+          $stage = Join-Path $root 'package'
+          New-Item -ItemType Directory -Force $out, $stage, "$stage\Assets", "$out\Dependencies" | Out-Null
+          Start-Transcript -Path "$out\build-transcript.txt" -Force | Out-Null
+          try {
+              $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+              if (!(Test-Path $vswhere)) { throw 'Visual Studio locator is missing on this runner.' }
+              $vs = & $vswhere -latest -products '*' -version '[17.0,18.0)' -property installationPath
+              if (!$vs) { throw 'Visual Studio 2022 was not found.' }
+              $msbuild = Join-Path $vs 'MSBuild\Current\Bin\MSBuild.exe'
+              $kits = "${env:ProgramFiles(x86)}\Windows Kits\10"
+              $versions = @(Get-ChildItem "$kits\Include" -Directory | Where-Object {
+                  (Test-Path (Join-Path $_.FullName 'cppwinrt\winrt\base.h')) -and
+                  (Test-Path "$kits\bin\$($_.Name)\x64\makeappx.exe") -and
+                  (Test-Path "$kits\Lib\$($_.Name)\um\x64\windowsapp.lib")
+              } | Sort-Object { [version]$_.Name } -Descending)
+              if (!$versions.Count) { throw 'A Windows SDK with C++/WinRT and packaging tools is required.' }
+              $sdk = $versions[0].Name
+              $preferred = @($versions | Where-Object Name -eq '10.0.19041.0')
+              if ($preferred.Count) { $sdk = $preferred[0].Name }
+              Write-Host "Visual Studio: $vs"
+              Write-Host "SDK: $sdk; target: native UWP x64; minimum OS: 10.0.17763.0"
+              & $msbuild "$root\Probe.vcxproj" /m /t:Build /p:Configuration=Release /p:Platform=x64 "/p:WindowsTargetPlatformVersion=$sdk" /v:minimal "/bl:$out\build.binlog"
+              if ($LASTEXITCODE -ne 0) { throw "C++ build failed with exit code $LASTEXITCODE. See build.binlog and transcript." }
+              Copy-Item "$root\bin\NexiaXboxProbe.exe" "$stage\NexiaXboxProbe.exe"
+
+              # Include the UWP runtime dependency, never the desktop VCLibs package.
+              $redistRoots = @(
+                  (Join-Path $vs 'VC\Redist'),
+                  "${env:ProgramFiles(x86)}\Microsoft SDKs\Windows Kits\10\ExtensionSDKs\Microsoft.VCLibs",
+                  "$env:ProgramFiles\Microsoft SDKs\Windows Kits\10\ExtensionSDKs\Microsoft.VCLibs"
+              )
+              $candidates = @($redistRoots | Where-Object { Test-Path $_ } | ForEach-Object {
+                  Get-ChildItem $_ -Recurse -Filter 'Microsoft.VCLibs.x64.14.00.appx' -ErrorAction SilentlyContinue
+              })
+              if (!$candidates.Count) { throw 'The UWP x64 Microsoft.VCLibs.140.00 dependency is missing from this runner.' }
+              Add-Type -AssemblyName System.IO.Compression.FileSystem
+              $runtime = @($candidates | ForEach-Object {
+                  $zip = [IO.Compression.ZipFile]::OpenRead($_.FullName)
+                  try {
+                      $entry = $zip.GetEntry('AppxManifest.xml')
+                      if (!$entry) { throw 'VCLibs package has no manifest.' }
+                      $reader = [IO.StreamReader]::new($entry.Open())
+                      try { [xml]$xml = $reader.ReadToEnd() } finally { $reader.Dispose() }
+                      if ($xml.Package.Identity.Name -eq 'Microsoft.VCLibs.140.00') {
+                          [PSCustomObject]@{ Path=$_.FullName; Version=[version]$xml.Package.Identity.Version; Publisher=[string]$xml.Package.Identity.Publisher }
+                      }
+                  } finally { $zip.Dispose() }
+              } | Sort-Object Version -Descending)
+              if (!$runtime.Count) { throw 'No usable UWP VCLibs package was found.' }
+              $runtime = $runtime[0]
+              Copy-Item $runtime.Path "$out\Dependencies\Microsoft.VCLibs.x64.14.00.appx"
+
+              # Original placeholder art generated locally; no copyrighted game assets.
+              Add-Type -AssemblyName System.Drawing
+              foreach ($asset in @(@('StoreLogo.png',50,50), @('Square44.png',44,44), @('Square150.png',150,150), @('Splash.png',620,300))) {
+                  $bitmap = [Drawing.Bitmap]::new([int]$asset[1], [int]$asset[2])
+                  $graphics = [Drawing.Graphics]::FromImage($bitmap)
+                  $brush = [Drawing.SolidBrush]::new([Drawing.Color]::FromArgb(70,190,180))
+                  try {
+                      $graphics.Clear([Drawing.Color]::FromArgb(12,20,30))
+                      $graphics.FillRectangle($brush, [int]($asset[1]/4), [int]($asset[2]/4), [int]($asset[1]/2), [int]($asset[2]/2))
+                      $bitmap.Save((Join-Path "$stage\Assets" $asset[0]), [Drawing.Imaging.ImageFormat]::Png)
+                  } finally { $brush.Dispose(); $graphics.Dispose(); $bitmap.Dispose() }
+              }
+              $version = "0.1.$BuildNumber.0"
+              $publisher = 'CN=NexiaXboxProbe'
+              $runtimePublisher = [Security.SecurityElement]::Escape($runtime.Publisher)
+              @"
+          <?xml version="1.0" encoding="utf-8"?>
+          <Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10" xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10" IgnorableNamespaces="uap">
+            <Identity Name="NexiaXboxProbe" Publisher="$publisher" Version="$version" ProcessorArchitecture="x64" />
+            <Properties><DisplayName>Nexia Xbox Probe</DisplayName><PublisherDisplayName>Personal Xbox port experiment</PublisherDisplayName><Logo>Assets\StoreLogo.png</Logo></Properties>
+            <Resources><Resource Language="en-us" /></Resources>
+            <Dependencies>
+              <TargetDeviceFamily Name="Windows.Universal" MinVersion="10.0.17763.0" MaxVersionTested="$sdk" />
+              <PackageDependency Name="Microsoft.VCLibs.140.00" MinVersion="$($runtime.Version)" Publisher="$runtimePublisher" />
+            </Dependencies>
+            <Applications>
+              <Application Id="App" Executable="NexiaXboxProbe.exe" EntryPoint="NexiaXboxProbe.App">
+                <uap:VisualElements DisplayName="Nexia Xbox Probe" Description="Native UWP diagnostic only. Does not run games." BackgroundColor="#0C141E" Square150x150Logo="Assets\Square150.png" Square44x44Logo="Assets\Square44.png">
+                  <uap:SplashScreen Image="Assets\Splash.png" />
+                </uap:VisualElements>
+              </Application>
+            </Applications>
+          </Package>
+          "@ | Set-Content "$stage\AppxManifest.xml" -Encoding utf8
+              $package = "$out\NexiaXboxProbe_${version}_x64.appx"
+              & "$kits\bin\$sdk\x64\makeappx.exe" pack /d $stage /p $package /o
+              if ($LASTEXITCODE -ne 0) { throw 'APPX packaging failed.' }
+
+              # One-use development signing key: never exported or included in artifacts.
+              $cert = New-SelfSignedCertificate -Type Custom -Subject $publisher -KeyUsage DigitalSignature -KeyAlgorithm RSA -KeyLength 2048 -HashAlgorithm SHA256 -CertStoreLocation 'Cert:\CurrentUser\My' -TextExtension @('2.5.29.37={text}1.3.6.1.5.5.7.3.3') -NotAfter (Get-Date).AddMonths(6)
+              try {
+                  & "$kits\bin\$sdk\x64\signtool.exe" sign /fd SHA256 /s My /sha1 $cert.Thumbprint $package
+                  if ($LASTEXITCODE -ne 0) { throw 'APPX signing failed.' }
+                  Export-Certificate -Cert $cert -FilePath "$out\NexiaXboxProbe.cer" | Out-Null
+              } finally { Remove-Item "Cert:\CurrentUser\My\$($cert.Thumbprint)" -ErrorAction SilentlyContinue }
+              Copy-Item "$root\README.md" "$out\READ-ME-FIRST.txt"
+              Get-FileHash $package -Algorithm SHA256 | Format-List | Out-File "$out\SHA256.txt"
+              Write-Host 'Package created. BUILD SUCCESS IS NOT PROOF THAT IT RUNS ON XBOX.'
+          } finally { Stop-Transcript | Out-Null }
+          ''', encoding="utf-8")
+          (root / 'README.md').write_text(r'''# Nexia Xbox Probe - FIRST TEST, NOT AN EMULATOR
+
+          This is an independent native C++/WinRT UWP x64 diagnostic app. It does not
+          contain Nexia's emulator, a managed .NET host, XNA, avatars, or any game files.
+          Building or launching this app does NOT demonstrate CastleMiner Z compatibility.
+          It tests only our cloud-build, packaging, deployment, graphics, input and local
+          storage path. The Nexia port itself remains a separate, unimplemented milestone.
+
+          ## Phone-only setup
+
+          1. Open your fork in Safari while signed in to GitHub.
+          2. On the Code page choose Add file -> Create new file. (Use desktop website
+             mode if the controls are hidden on mobile.)
+          3. Name the file .github/workflows/xbox-probe.yml.
+          4. Paste the ENTIRE supplied xbox-probe.yml file into the editor and commit it
+             to Mousehook. Do not paste the ZIP. The workflow embeds the diagnostic source
+             in plain text, so this is the only repository file you need to add.
+          5. Open Actions. If GitHub displays a fork-workflow enablement message, enable
+             workflows for your own fork. Choose "Xbox - Native Diagnostic (not emulator)"
+             and use Run workflow -> Mousehook -> Run workflow if a run did not start.
+          6. Open that run. At the bottom, download the XboxProbe-x64 artifact. Open the
+             ZIP using the iPhone Files app. Failure artifacts may contain only build logs.
+
+          ## Xbox installation and first test
+
+          Use Xbox Developer Mode and the existing Xbox Device Portal connection from
+          Safari. Use the portal's app deployment controls to choose the NexiaXboxProbe
+          x64 .appx and the included Dependencies/Microsoft.VCLibs.x64.14.00.appx.
+          Do not install this as an update to Xenia; it has its own package identity.
+          The .cer is a public test certificate, not a game or a private signing key.
+          Do not install it as a phone profile. If deployment rejects the certificate or
+          dependencies, report the complete error rather than changing unrelated settings.
+
+          Launch Nexia Xbox Probe. Take a picture of the diagnostic screen. Move the left
+          stick; the values should change. Press A; the test count should increase and the
+          storage test should say PASS. A launch can still fail even after a successful
+          build. Report the full message or the app's LocalState/probe-log.txt when possible.
+          The log is reset each launch and contains test outcomes, not account credentials.
+          The storage test writes only this app's LocalState/probe-save.txt.
+
+          ## Cloud-build behavior and security
+
+          The workflow runs only on manual request or when its own YAML is changed. It
+          uses a standard windows-2022 GitHub-hosted runner and has read-only repository
+          permissions. It does not check out or build the rest of Nexia, download game files,
+          connect to your Xbox, access repository secrets, or create a release.
+          Artifacts expire after seven days. No signing private key is exported. Each build
+          uses a fresh self-signed development certificate, so an update may require a
+          fresh install of this diagnostic app only; keep any useful logs before removing it.
+          Never uninstall your working Xenia as part of this test.
+
+          A stock Visual Studio 2022 Windows runner with a Windows SDK and UWP C++ support
+          is expected. The script selects an installed SDK and fails with logs if a needed
+          component is absent; it does not silently turn the target into a desktop app.
+          The current minimum OS is 10.0.17763.0. The package has no network capability.
+
+          ## Status at preparation
+
+          Source and workflow prepared and locally checked for file consistency, YAML,
+          project XML, and template XML structure. No Windows compilation, APPX signing,
+          GitHub Actions run, installation, or Xbox execution has been performed by the
+          author of this generated starter. Build scripts and C++ may still need fixes.
+
+          ## After this diagnostic
+
+          Next engineering gate: validate an Xbox-compatible managed runtime and XNA
+          rendering path before transplanting Nexia's XBLIG host. Successful native tests
+          do not answer that managed-runtime question. No Microsoft XNA runtime files or
+          CastleMiner Z assets should be committed to a public repository.
+          ''', encoding="utf-8")
+
+      - name: Compile, package and development-sign native UWP x64
+        shell: pwsh
+        env:
+          PROBE_BUILD_NUMBER: ${{ github.run_number }}
+        run: ./xbox-probe/build.ps1 -BuildNumber ([int]$env:PROBE_BUILD_NUMBER)
+
+      - name: Upload package or failure logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: XboxProbe-x64-${{ github.run_number }}
+          path: xbox-probe/out/
+          retention-days: 7
+          if-no-files-found: warn
