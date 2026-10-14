@@ -1,0 +1,773 @@
+# Replace CODE ONLY in .github/workflows/xbox-cmz-startup.yml; keep Mousehook and the filename.
+# Corrects the 0.13 menu-preference recovery test and accepts both menu-art ZIP names.
+# Original game, artwork, and music are NOT downloaded or included in this public build.
+name: Xbox - CMZ Original Startup
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [Mousehook]
+    paths:
+      - '.github/workflows/xbox-cmz-startup.yml'
+permissions:
+  contents: read
+concurrency:
+  group: xbox-cmz-startup-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 25
+    steps:
+      - name: Recover exact 0.13 source from the diagnosed run
+        shell: python
+        run: |
+          import hashlib, re, textwrap
+          from urllib.request import urlopen
+          url = ('https://raw.githubusercontent.com/tjkeelan13-ctrl/'
+                 'Nexia360-emulation-edition/215a65b3caad70bd432616075e755979fb4e0aff/'
+                 '.github/workflows/xbox-cmz-startup.yml')
+          with urlopen(url, timeout=45) as response:
+              data = response.read()
+          if hashlib.sha256(data).hexdigest() != '6cbc2cb457f65fae626c867cd8b0bacb2f93ef012695cd5e7e7c2c808fa91996':
+              raise RuntimeError('Pinned menu-bundle source integrity mismatch')
+          blocks = re.findall(r'(?m)^        shell: python\n        run: \|\n((?: {10}.*\n|\n)*)', data.decode('utf-8-sig'))
+          if len(blocks) != 22:
+              raise RuntimeError('Unexpected pinned 0.13 source structure')
+          for block in blocks:
+              exec(compile(textwrap.dedent(block), 'verified-startup13-source', 'exec'), {})
+          print('Recovered exact menu bundle; applying diagnosed recovery and input-name corrections.')
+      - name: Write repaired MenuPreferences13.cs
+        shell: python
+        run: |
+          from pathlib import Path
+          path = Path('xbox-cmz-services') / 'MenuPreferences13.cs'
+          path.parent.mkdir(parents=True, exist_ok=True)
+          path.write_text(r'''// Only menu preferences. Never reads/writes the game's world, inventory, entitlement or stats.sav.
+          using System;
+          using System.IO;
+          using System.Security.Cryptography;
+          namespace NexiaCMZLoader {
+              public sealed class MenuPreferenceValues13 {
+                  public float Brightness=0, Sensitivity=1, Music=1;
+                  public bool Invert;
+              }
+              public static class MenuPreferences13 {
+                  private const int Magic=0x13314D43;
+                  private static readonly object Gate=new object();
+                  private static void Range(float x,float min,float max) {
+                      if(float.IsNaN(x)||float.IsInfinity(x)||x<min||x>max)throw new InvalidDataException("Menu preference outside its allowed range.");
+                  }
+                  public static byte[] Encode(int slot,MenuPreferenceValues13 v) {
+                      MenuPolicy13.Slot(slot);if(v==null)throw new ArgumentNullException("v");
+                      Range(v.Brightness,0,0.5f);Range(v.Sensitivity,0.5f,2);Range(v.Music,0,1);
+                      using(var ms=new MemoryStream()) {
+                          using(var w=new BinaryWriter(ms,System.Text.Encoding.UTF8,true)) {
+                              w.Write(Magic);w.Write(1);w.Write(slot);w.Write(v.Brightness);w.Write(v.Sensitivity);w.Write(v.Music);w.Write(v.Invert);
+                          }
+                          var payload=ms.ToArray();using(var sha=SHA256.Create()) {var hash=sha.ComputeHash(payload);ms.Write(hash,0,hash.Length);}return ms.ToArray();
+                      }
+                  }
+                  public static MenuPreferenceValues13 Decode(int slot,byte[] bytes) {
+                      MenuPolicy13.Slot(slot);if(bytes==null||bytes.Length!=57)throw new InvalidDataException("Menu preference length mismatch.");
+                      using(var sha=SHA256.Create()) {
+                          var expected=sha.ComputeHash(bytes,0,25);int diff=0;for(int i=0;i<32;i++)diff|=expected[i]^bytes[25+i];
+                          if(diff!=0)throw new InvalidDataException("Menu preference checksum mismatch.");
+                      }
+                      using(var r=new BinaryReader(new MemoryStream(bytes,false))) {
+                          if(r.ReadInt32()!=Magic||r.ReadInt32()!=1||r.ReadInt32()!=slot)throw new InvalidDataException("Menu preference version/slot mismatch.");
+                          var v=new MenuPreferenceValues13{Brightness=r.ReadSingle(),Sensitivity=r.ReadSingle(),Music=r.ReadSingle()};
+                          byte b=r.ReadByte();if(b>1)throw new InvalidDataException("Invalid invert preference.");v.Invert=b==1;
+                          Encode(slot,v);return v;
+                      }
+                  }
+                  private static string FileName(string root,int slot) {MenuPolicy13.Slot(slot);return Path.Combine(root,"slot-"+slot+".bin");}
+                  public static MenuPreferenceValues13 Load(string root,int slot,out string note) {
+                      lock(Gate) {
+                          string path=FileName(root,slot);note="defaults (no saved menu preferences)";
+                          foreach(string candidate in new[]{path,path+".bak"}) {
+                              if(!File.Exists(candidate))continue;
+                              try {
+                                  if(new FileInfo(candidate).Length!=57)throw new InvalidDataException("Unexpected preference size.");
+                                  var value=Decode(slot,File.ReadAllBytes(candidate));note=candidate==path?"restored":"restored backup; invalid primary retained";return value;
+                              } catch(Exception ex) when(ex is InvalidDataException||ex is IOException||ex is UnauthorizedAccessException) {note="saved preferences invalid/unreadable; defaults used: "+ex.Message;}
+                          }
+                          return new MenuPreferenceValues13();
+                      }
+                  }
+                  // A subsequent save after backup recovery must not replace that backup with bad data.
+                  private static bool ValidPrimary(string path,int slot) {
+                      if(!File.Exists(path))return false;
+                      try {
+                          if(new FileInfo(path).Length!=57)return false;
+                          Decode(slot,File.ReadAllBytes(path));return true;
+                      } catch(InvalidDataException) {return false;}
+                      // Access/I/O errors propagate during a write; an unreadable file is not assumed corrupt.
+                  }
+                  public static void Save(string root,int slot,MenuPreferenceValues13 value) {
+                      byte[] bytes=Encode(slot,value);
+                      lock(Gate) {
+                          Directory.CreateDirectory(root);
+                          string path=FileName(root,slot),temp=path+".tmp",backup=path+".bak",bad=path+".corrupt";
+                          bool movedToBackup=false,movedToBad=false;
+                          try {
+                              using(var output=new FileStream(temp,FileMode.Create,FileAccess.Write,FileShare.None)) {
+                                  output.Write(bytes,0,bytes.Length);output.Flush();
+                              }
+                              Decode(slot,File.ReadAllBytes(temp));
+                              if(File.Exists(path)) {
+                                  if(ValidPrimary(path,slot)) {
+                                      if(File.Exists(backup))File.Delete(backup);
+                                      File.Move(path,backup);movedToBackup=true;
+                                  } else {
+                                      // Preserve the most recent rejected primary separately, leaving a good backup intact.
+                                      if(File.Exists(bad))File.Delete(bad);
+                                      File.Move(path,bad);movedToBad=true;
+                                  }
+                              }
+                              File.Move(temp,path);
+                          } catch(Exception writeError) {
+                              try {
+                                  if(!File.Exists(path)) {
+                                      if(movedToBackup&&File.Exists(backup))File.Copy(backup,path);
+                                      else if(movedToBad&&File.Exists(bad))File.Copy(bad,path);
+                                  }
+                              } catch(Exception restoreError) {
+                                  throw new AggregateException("Preference write and rollback both failed; preserved copies were not removed.",writeError,restoreError);
+                              }
+                              throw;
+                          } finally {if(File.Exists(temp))File.Delete(temp);}
+                      }
+                  }
+              }
+          }
+          ''', encoding='utf-8')
+      - name: Write repaired MenuSprites13.cs
+        shell: python
+        run: |
+          from pathlib import Path
+          path = Path('xbox-cmz-services') / 'MenuSprites13.cs'
+          path.parent.mkdir(parents=True, exist_ok=True)
+          path.write_text(r'''// Exact private atlas input. No original sprite art is in the public source/workflow.
+          using System;
+          using System.IO;
+          using System.IO.Compression;
+          using System.Security.Cryptography;
+          namespace NexiaCMZLoader {
+              public static class MenuSprites13 {
+                  public const string ZipName="CastleMinerZ-menu-content.zip";
+                  public const string LegacyZipName="CastleMinerZ-menu-sprites.zip";
+                  public const string ZipHash="9726ea73e1bebb73d7fe537e613574524a723cf6ff5b4942b71946c360553e9d";
+                  public const string LegacyZipHash="f66f63f8437b4fbcf9455039ec9cf32f6ead0f6e92f4bef42301a416aaabf6b4";
+                  public const string AssetHash="954b9db30b85b0cc6d33aeb905a309c74457d0b7dc134703cad8dedd24430c1f";
+                  public const long ZipLength=316913, AssetLength=1140801;
+                  private static string assetPath;
+                  public static string Hash(Stream stream) {using(var s=SHA256.Create())return BitConverter.ToString(s.ComputeHash(stream)).Replace("-","").ToLowerInvariant();}
+                  private static bool Verified(string path,long length,string hash) {
+                      if(!File.Exists(path)||new FileInfo(path).Length!=length)return false;
+                      using(var s=File.OpenRead(path))return Hash(s)==hash;
+                  }
+                  public static bool AcceptsArchive(string name,long length,string hash) {
+                      return (name==ZipName||name==LegacyZipName)&&length==ZipLength&&
+                          (hash==ZipHash||hash==LegacyZipHash);
+                  }
+                  private static string SelectArchive(string local) {
+                      foreach(var name in new[]{ZipName,LegacyZipName}) {
+                          string candidate=Path.Combine(local,name);
+                          if(!File.Exists(candidate)||new FileInfo(candidate).Length!=ZipLength)continue;
+                          using(var input=File.OpenRead(candidate))
+                              if(AcceptsArchive(name,new FileInfo(candidate).Length,Hash(input)))return candidate;
+                      }
+                      throw new InvalidDataException("Add the intact "+ZipName+" or the earlier "+LegacyZipName+" directly to LocalState. Exact known ZIP and sprite hashes are still required.");
+                  }
+                  public static void Import(string local) {
+                      assetPath=null;string zip=SelectArchive(local);
+                      string folder=Path.Combine(local,"MenuContent13"),path=Path.Combine(folder,"SpriteSheet.xnb");Directory.CreateDirectory(folder);
+                      if(!Verified(path,AssetLength,AssetHash)) {
+                          string temp=path+".tmp";
+                          try {
+                              using(var archive=ZipFile.OpenRead(zip)) {
+                                  if(archive.Entries.Count!=1 || archive.Entries[0].FullName!="SpriteSheet.xnb" || archive.Entries[0].Length!=AssetLength)
+                                      throw new InvalidDataException("Unexpected menu atlas archive contents.");
+                                  using(var input=archive.Entries[0].Open())using(var output=File.Create(temp)) {
+                                      byte[] buf=new byte[65536];long count=0;int n;
+                                      while((n=input.Read(buf,0,buf.Length))>0){count+=n;if(count>AssetLength)throw new InvalidDataException("Oversized menu atlas.");output.Write(buf,0,n);}
+                                      if(count!=AssetLength)throw new EndOfStreamException();
+                                  }
+                              }
+                              if(!Verified(temp,AssetLength,AssetHash))throw new InvalidDataException("Menu atlas data verification failed.");
+                              if(File.Exists(path))File.Delete(path);File.Move(temp,path);
+                          } finally {if(File.Exists(temp))File.Delete(temp);}
+                      }
+                      assetPath=path;
+                      StartupHooks.Note("MENU ART INPUT: verified "+Path.GetFileName(zip)+" and original SpriteSheet hash. Both previously supplied ZIP names are supported.");
+                  }
+                  public static string OverridePath(string name) {
+                      if(!string.Equals(name.Replace('\\','/'),"SpriteSheet",StringComparison.OrdinalIgnoreCase))return null;
+                      if(assetPath==null)throw new InvalidOperationException("Menu sprite input was not verified.");return assetPath;
+                  }
+              }
+          }
+          ''', encoding='utf-8')
+      - name: Write repaired MenuTests13/MenuTests13.csproj
+        shell: python
+        run: |
+          from pathlib import Path
+          path = Path('xbox-cmz-services') / 'MenuTests13/MenuTests13.csproj'
+          path.parent.mkdir(parents=True, exist_ok=True)
+          path.write_text(r'''<Project Sdk="Microsoft.NET.Sdk">
+            <PropertyGroup><TargetFramework>net8.0</TargetFramework><OutputType>Exe</OutputType><StartupObject>Program</StartupObject><ImplicitUsings>disable</ImplicitUsings><Nullable>disable</Nullable><EnableDefaultCompileItems>false</EnableDefaultCompileItems></PropertyGroup>
+            <ItemGroup>
+              <Compile Include="Program.cs"/><Compile Include="Fixtures.cs"/>
+              <Compile Include="../MenuPolicy13.cs" Link="MenuPolicy13.cs"/>
+              <Compile Include="../MenuPreferences13.cs" Link="MenuPreferences13.cs"/>
+              <Compile Include="../MenuSprites13.cs" Link="MenuSprites13.cs"/>
+              <Compile Include="../MenuPatch13.cs" Link="MenuPatch13.cs"/>
+              <Compile Include="../MenuBatch13.cs" Link="MenuBatch13.cs"/>
+              <PackageReference Include="Mono.Cecil" Version="0.11.6"/>
+            </ItemGroup>
+          </Project>
+          ''', encoding='utf-8')
+      - name: Write repaired MenuTests13/Program.cs
+        shell: python
+        run: |
+          from pathlib import Path
+          path = Path('xbox-cmz-services') / 'MenuTests13/Program.cs'
+          path.parent.mkdir(parents=True, exist_ok=True)
+          path.write_text(r'''// Compile and exercise exact policy/preferences/IL patch code against synthetic inputs.
+          // No original game binaries, user artwork, Windows graphics runtime or console are involved.
+          using System;
+          using System.IO;
+          using System.Linq;
+          using System.Reflection;
+          using System.Security.Cryptography;
+          using System.Runtime.Loader;
+          using Mono.Cecil;
+          using Mono.Cecil.Cil;
+          using NexiaCMZLoader;
+          using MA=Mono.Cecil.MethodAttributes;
+          using TA=Mono.Cecil.TypeAttributes;
+          using FA=Mono.Cecil.FieldAttributes;
+          internal static class Program {
+              private static int count,failed;
+              private static void Require(bool value,string why){if(!value)throw new Exception(why);}
+              private static void Test(string name,Action action) {
+                  try {action();count++;Console.WriteLine("PASS "+name);}
+                  catch(Exception error) {failed++;Console.Error.WriteLine("FAIL "+name+"\n"+error);}
+              }
+              private static void TestInFolder(string parent,string name,Action<string> action) {
+                  Test(name,()=>{string folder=Path.Combine(parent,Guid.NewGuid().ToString("N"));Directory.CreateDirectory(folder);
+                      try{action(folder);}finally{Directory.Delete(folder,true);}});
+              }
+              private static void Throws<T>(Action action) where T:Exception {try{action();}catch(T){return;}throw new Exception("Expected "+typeof(T).Name);}
+              private static byte[] Sign(byte[] data){using(var sha=SHA256.Create()){var h=sha.ComputeHash(data,0,25);Array.Copy(h,0,data,25,32);}return data;}
+              private static AssemblyDefinition Fixture() {
+                  var a=AssemblyDefinition.CreateAssembly(new AssemblyNameDefinition("MenuFixture"+Guid.NewGuid().ToString("N"),new Version(1,0)),"fixture",ModuleKind.Dll);
+                  var m=a.MainModule;var t=new TypeDefinition("Fixtures","Original",TA.Public|TA.Class,m.TypeSystem.Object);m.Types.Add(t);
+                  var ctor=new MethodDefinition(".ctor",MA.Public|MA.SpecialName|MA.RTSpecialName,m.TypeSystem.Void);t.Methods.Add(ctor);
+                  var il=ctor.Body.GetILProcessor();il.Emit(OpCodes.Ldarg_0);il.Emit(OpCodes.Call,m.ImportReference(typeof(object).GetConstructor(Type.EmptyTypes)));il.Emit(OpCodes.Ret);
+                  var value=new FieldDefinition("Value",FA.Public,m.TypeSystem.Int32);t.Fields.Add(value);
+                  var source=new MethodDefinition("SecondaryLoad",MA.Public,m.TypeSystem.Void);t.Methods.Add(source);source.Body.InitLocals=true;
+                  var variable=new VariableDefinition(m.TypeSystem.Int32);source.Body.Variables.Add(variable);il=source.Body.GetILProcessor();
+                  il.Emit(OpCodes.Ldc_I4,7);il.Emit(OpCodes.Stloc,variable);il.Emit(OpCodes.Ldarg_0);il.Emit(OpCodes.Ldloc,variable);il.Emit(OpCodes.Stfld,value); // 0..18
+                  il.Emit(OpCodes.Ldarg_0);il.Emit(OpCodes.Ldc_I4,99);il.Emit(OpCodes.Stfld,value); // excluded whole assignment
+                  il.Emit(OpCodes.Ret);
+                  var branch=new MethodDefinition("Branch",MA.Public,m.TypeSystem.Void);t.Methods.Add(branch);il=branch.Body.GetILProcessor();var end=Instruction.Create(OpCodes.Ret);il.Emit(OpCodes.Br,end);il.Append(end);
+                  foreach(var tuple in new[]{("StartHandler",2),("SelectHandler",2),("SaveHandler",1)}) {
+                      var method=new MethodDefinition(tuple.Item1,MA.Public,m.TypeSystem.Void);t.Methods.Add(method);
+                      for(int i=0;i<tuple.Item2;i++)method.Parameters.Add(new ParameterDefinition("p"+i,Mono.Cecil.ParameterAttributes.None,m.TypeSystem.Object));
+                      method.Body.GetILProcessor().Emit(OpCodes.Ret);
+                  }
+                  // Re-read so byte offsets and CodeSize are the same representation consumed at runtime.
+                  using(var stream=new MemoryStream()){a.Write(stream);a.Dispose();return AssemblyDefinition.ReadAssembly(new MemoryStream(stream.ToArray()),new ReaderParameters{ReadingMode=ReadingMode.Immediate});}
+              }
+              private static void ILTests() {
+                  using(var a=Fixture()) {
+                      var t=a.MainModule.GetType("Fixtures.Original");var source=t.Methods.Single(m=>m.Name=="SecondaryLoad");
+                      var original=source.Body.Instructions.Select(i=>i.ToString()).ToArray();int cut=source.Body.Instructions[5].Offset,last=source.Body.Instructions.Last().Offset;
+                      var copy=MenuPatch13.CopyStraightLineSlices(t,source,"MenuBoot",new[]{new[]{0,cut},new[]{last,source.Body.CodeSize}});
+                      Test("original body retained exactly",()=>Require(original.SequenceEqual(source.Body.Instructions.Select(i=>i.ToString())),"original mutated"));
+                      Test("cloned locals are independent",()=>Require(!object.ReferenceEquals(copy.Body.Variables[0],source.Body.Variables[0]) && copy.Body.Instructions.Where(i=>i.Operand is VariableDefinition).All(i=>object.ReferenceEquals(i.Operand,copy.Body.Variables[0])),"local remap"));
+                      Test("reversed ranges rejected",()=>Throws<ArgumentException>(()=>MenuPatch13.CopyStraightLineSlices(t,source,"bad",new[]{new[]{cut,0}})));
+                      Test("overlap rejected",()=>Throws<ArgumentException>(()=>MenuPatch13.CopyStraightLineSlices(t,source,"bad",new[]{new[]{0,cut},new[]{0,source.Body.CodeSize}})));
+                      Test("middle of instruction rejected",()=>Throws<InvalidOperationException>(()=>MenuPatch13.CopyStraightLineSlices(t,source,"bad",new[]{new[]{1,cut}})));
+                      Test("missing final return rejected",()=>Throws<InvalidOperationException>(()=>MenuPatch13.CopyStraightLineSlices(t,source,"bad",new[]{new[]{0,cut}})));
+                      var branch=t.Methods.Single(m=>m.Name=="Branch");
+                      Test("branch-containing slice rejected",()=>Throws<NotSupportedException>(()=>MenuPatch13.CopyStraightLineSlices(t,branch,"bad",new[]{new[]{0,branch.Body.CodeSize}})));
+                      Test("full mode leaves input module untouched",()=>{MenuStage13.Enabled=false;MenuPatch13.Apply(a.MainModule,s=>{});Require(source.Body.Instructions.Count==original.Length,"changed");});
+                      MenuPatch13.RouteHandler(a.MainModule,t,"StartHandler",2,"Start",false);
+                      MenuPatch13.RouteHandler(a.MainModule,t,"SelectHandler",2,"MainSelected",true);
+                      MenuPatch13.RouteHandler(a.MainModule,t,"SaveHandler",1,"Save",true);
+                      Test("missing hook rejected",()=>Throws<MissingMethodException>(()=>MenuPatch13.RouteHandler(a.MainModule,t,"StartHandler",2,"NoSuchHook",false)));
+                      byte[] bytes;using(var s=new MemoryStream()){a.Write(s);bytes=s.ToArray();}
+                      // Load the patched fixture, resolving recording hooks to this test assembly.
+                      var context=new AssemblyLoadContext("menu-test-"+Guid.NewGuid(),true);
+                      context.Resolving+=(c,n)=>n.Name==typeof(Program).Assembly.GetName().Name?typeof(Program).Assembly:null;
+                      try {
+                          var assembly=context.LoadFromStream(new MemoryStream(bytes));var type=assembly.GetType("Fixtures.Original",true);var obj=Activator.CreateInstance(type);
+                          Test("menu IL executes retained block, not deferred block",()=>{type.GetMethod("MenuBoot",BindingFlags.NonPublic|BindingFlags.Instance).Invoke(obj,null);Require((int)type.GetField("Value").GetValue(obj)==7,"not 7");});
+                          Test("original full body still executes deferred block",()=>{type.GetMethod("SecondaryLoad").Invoke(obj,null);Require((int)type.GetField("Value").GetValue(obj)==99,"not 99");});
+                          var sender=new object();var args=new object();
+                          Test("Start hook receives original owner",()=>{type.GetMethod("StartHandler").Invoke(obj,new[]{sender,args});Require(object.ReferenceEquals(MenuStage13.Owner,obj)&&MenuStage13.Argument==null&&MenuStage13.Hook=="Start","wrong Start");});
+                          Test("selection hook receives original owner and final event args",()=>{type.GetMethod("SelectHandler").Invoke(obj,new[]{sender,args});Require(object.ReferenceEquals(MenuStage13.Owner,obj)&&object.ReferenceEquals(MenuStage13.Argument,args)&&MenuStage13.Hook=="MainSelected","wrong select");});
+                          Test("save hook receives original stats object",()=>{type.GetMethod("SaveHandler").Invoke(obj,new[]{args});Require(object.ReferenceEquals(MenuStage13.Owner,obj)&&object.ReferenceEquals(MenuStage13.Argument,args)&&MenuStage13.Hook=="Save","wrong save");});
+                      } finally {context.Unload();}
+                  }
+              }
+              public static int Main() {
+                  string root=Path.Combine(Path.GetTempPath(),"menu13-"+Guid.NewGuid().ToString("N"));Directory.CreateDirectory(root);
+                  try {
+                      Test("default mode is menu",()=>Require(MenuPolicy13.ParseMode(null),"default"));
+                      Test("explicit menu mode accepts whitespace/case",()=>Require(MenuPolicy13.ParseMode(" MENU\r\n"),"menu"));
+                      Test("explicit full mode preserved",()=>Require(!MenuPolicy13.ParseMode(" full "),"full"));
+                      Test("unknown mode rejected",()=>Throws<ArgumentException>(()=>MenuPolicy13.ParseMode("fake")));
+                      Test("all physical slots accepted",()=>{for(int i=0;i<4;i++)Require(MenuPolicy13.Slot(i)==i,"slot");});
+                      Test("invalid slots rejected",()=>{Throws<ArgumentOutOfRangeException>(()=>MenuPolicy13.Slot(-1));Throws<ArgumentOutOfRangeException>(()=>MenuPolicy13.Slot(4));});
+                      Test("main Options route",()=>Require(MenuPolicy13.Main(5)==MenuAction13.Options,"options"));
+                      Test("main return route",()=>Require(MenuPolicy13.Main(2)==MenuAction13.ReturnToTitle,"title"));
+                      Test("Play purchase codes awards unavailable",()=>{foreach(int tag in new[]{0,1,3,4,-1,100})Require(MenuPolicy13.Main(tag)==MenuAction13.Unavailable,"ungated "+tag);});
+                      Test("original Controls and Settings routes",()=>Require(MenuPolicy13.Options(0)==MenuAction13.Controls && MenuPolicy13.Options(2)==MenuAction13.Settings,"options"));
+                      Test("destructive world operations unavailable",()=>{foreach(int tag in new[]{1,3,-1,99})Require(MenuPolicy13.Options(tag)==MenuAction13.Unavailable,"storage "+tag);});
+                      var v=new MenuPreferenceValues13{Brightness=0.25f,Sensitivity=1.5f,Music=0.6f,Invert=true};
+                      byte[] data=MenuPreferences13.Encode(2,v);
+                      Test("preference roundtrip",()=>{var x=MenuPreferences13.Decode(2,data);Require(x.Brightness==v.Brightness&&x.Sensitivity==v.Sensitivity&&x.Music==v.Music&&x.Invert,"roundtrip");});
+                      Test("slot mismatch rejected",()=>Throws<InvalidDataException>(()=>MenuPreferences13.Decode(1,data)));
+                      Test("truncation and trailing data rejected",()=>{Throws<InvalidDataException>(()=>MenuPreferences13.Decode(2,data.Take(56).ToArray()));Throws<InvalidDataException>(()=>MenuPreferences13.Decode(2,data.Concat(new byte[]{0}).ToArray()));});
+                      Test("corruption rejected",()=>{var b=(byte[])data.Clone();b[13]^=1;Throws<InvalidDataException>(()=>MenuPreferences13.Decode(2,b));});
+                      Test("invalid magic rejected even with matching checksum",()=>{var b=(byte[])data.Clone();b[0]^=1;Throws<InvalidDataException>(()=>MenuPreferences13.Decode(2,Sign(b)));});
+                      Test("invalid boolean rejected even with matching checksum",()=>{var b=(byte[])data.Clone();b[24]=2;Throws<InvalidDataException>(()=>MenuPreferences13.Decode(2,Sign(b)));});
+                      Test("nonfinite values rejected",()=>{Throws<InvalidDataException>(()=>MenuPreferences13.Encode(0,new MenuPreferenceValues13{Music=float.NaN}));Throws<InvalidDataException>(()=>MenuPreferences13.Encode(0,new MenuPreferenceValues13{Sensitivity=float.PositiveInfinity}));});
+                      Test("out-of-range values rejected",()=>{Throws<InvalidDataException>(()=>MenuPreferences13.Encode(0,new MenuPreferenceValues13{Brightness=1}));Throws<InvalidDataException>(()=>MenuPreferences13.Encode(0,new MenuPreferenceValues13{Sensitivity=0}));});
+                      Test("preferences survive file reopen",()=>{MenuPreferences13.Save(root,2,v);string note;Require(MenuPreferences13.Load(root,2,out note).Music==v.Music,"reopen");});
+                      Test("slots remain separate",()=>{MenuPreferences13.Save(root,1,new MenuPreferenceValues13{Music=0.2f});string note;Require(MenuPreferences13.Load(root,1,out note).Music==0.2f && MenuPreferences13.Load(root,2,out note).Music==0.6f,"isolation");});
+                      Test("missing preferences use defaults",()=>{string note;Require(MenuPreferences13.Load(root,3,out note).Music==1,"defaults");});
+                      Test("prior good preferences recover from bad primary",()=>{MenuPreferences13.Save(root,2,new MenuPreferenceValues13{Music=0.8f});File.WriteAllText(Path.Combine(root,"slot-2.bin"),"bad");string note;Require(MenuPreferences13.Load(root,2,out note).Music==0.6f && note.Contains("backup"),"backup");Require(File.ReadAllText(Path.Combine(root,"slot-2.bin"))=="bad","original bad primary deleted");});
+                      Test("unrelated world sentinel untouched",()=>{string p=Path.Combine(root,"stats.sav");File.WriteAllText(p,"do not touch");MenuPreferences13.Save(root,0,v);Require(File.ReadAllText(p)=="do not touch","world data changed");});
+                      Test("invalid sprite input rejected",()=>Throws<InvalidDataException>(()=>MenuSprites13.Import(root)));
+                      Test("unrelated atlas path is not redirected",()=>Require(MenuSprites13.OverridePath("OtherSheet")==null,"unrelated"));
+                      Test("unverified atlas cannot be consumed",()=>Throws<InvalidOperationException>(()=>MenuSprites13.OverridePath("spritesheet")));
+                      string header=Path.Combine(root,"test.xnb");
+                      Action<byte,byte,byte,int> write=(platform,ver,flags,size)=>{using(var w=new BinaryWriter(File.Create(header))){w.Write(new byte[]{88,78,66,platform,ver,flags});w.Write(size);}};
+                      Test("prepared XNB header accepted",()=>{write(119,5,1,10);MenuBatch13.CheckHeader(header,true);});
+                      Test("Xbox original header not passed as converted",()=>{write(120,5,129,10);MenuBatch13.CheckHeader(header,false);Throws<InvalidDataException>(()=>MenuBatch13.CheckHeader(header,true));});
+                      Test("header length mismatch rejected",()=>{write(119,5,1,11);Throws<InvalidDataException>(()=>MenuBatch13.CheckHeader(header,true));});
+                      TestInFolder(root,"checksum corruption recovers backup",p=>{
+                          MenuPreferences13.Save(p,0,new MenuPreferenceValues13{Music=.25f});
+                          MenuPreferences13.Save(p,0,new MenuPreferenceValues13{Music=.75f});
+                          string file=Path.Combine(p,"slot-0.bin");byte[] b=File.ReadAllBytes(file);b[13]^=1;File.WriteAllBytes(file,b);
+                          string note;Require(MenuPreferences13.Load(p,0,out note).Music==.25f&&note.Contains("backup"),"checksum backup");
+                      });
+                      TestInFolder(root,"wrong-slot primary recovers backup",p=>{
+                          MenuPreferences13.Save(p,0,new MenuPreferenceValues13{Music=.25f});
+                          MenuPreferences13.Save(p,0,new MenuPreferenceValues13{Music=.75f});
+                          File.WriteAllBytes(Path.Combine(p,"slot-0.bin"),MenuPreferences13.Encode(1,new MenuPreferenceValues13{Music=.9f}));
+                          string note;Require(MenuPreferences13.Load(p,0,out note).Music==.25f&&note.Contains("backup"),"slot validation");
+                      });
+                      TestInFolder(root,"missing primary recovers backup",p=>{
+                          MenuPreferences13.Save(p,0,new MenuPreferenceValues13{Music=.25f});
+                          MenuPreferences13.Save(p,0,new MenuPreferenceValues13{Music=.75f});File.Delete(Path.Combine(p,"slot-0.bin"));
+                          string note;Require(MenuPreferences13.Load(p,0,out note).Music==.25f&&note.Contains("backup"),"missing primary");
+                      });
+                      TestInFolder(root,"both invalid records use defaults without deleting evidence",p=>{
+                          string file=Path.Combine(p,"slot-0.bin");File.WriteAllText(file,"bad primary");File.WriteAllText(file+".bak","bad backup");
+                          string note;Require(MenuPreferences13.Load(p,0,out note).Music==1f&&note.Contains("invalid"),"defaults");
+                          Require(File.ReadAllText(file)=="bad primary"&&File.ReadAllText(file+".bak")=="bad backup","evidence changed");
+                      });
+                      TestInFolder(root,"valid primary wins over an invalid backup",p=>{
+                          MenuPreferences13.Save(p,0,new MenuPreferenceValues13{Music=.75f});File.WriteAllText(Path.Combine(p,"slot-0.bin.bak"),"bad backup");
+                          string note;Require(MenuPreferences13.Load(p,0,out note).Music==.75f&&note=="restored","primary preference");
+                      });
+                      TestInFolder(root,"saving after recovery retains last good backup",p=>{
+                          MenuPreferences13.Save(p,0,new MenuPreferenceValues13{Music=.25f});MenuPreferences13.Save(p,0,new MenuPreferenceValues13{Music=.75f});
+                          string file=Path.Combine(p,"slot-0.bin");File.WriteAllText(file,"rejected primary");
+                          string note;Require(MenuPreferences13.Load(p,0,out note).Music==.25f,"first recovery");
+                          MenuPreferences13.Save(p,0,new MenuPreferenceValues13{Music=.5f});
+                          Require(MenuPreferences13.Decode(0,File.ReadAllBytes(file+".bak")).Music==.25f,"backup overwritten by corrupt primary");
+                          Require(File.ReadAllText(file+".corrupt")=="rejected primary","bad primary not retained");
+                          File.WriteAllText(file,"second failure");Require(MenuPreferences13.Load(p,0,out note).Music==.25f,"second recovery");
+                      });
+                      TestInFolder(root,"normal save advances backup and leaves no staging file",p=>{
+                          MenuPreferences13.Save(p,0,new MenuPreferenceValues13{Music=.25f});MenuPreferences13.Save(p,0,new MenuPreferenceValues13{Music=.75f});
+                          string file=Path.Combine(p,"slot-0.bin");Require(!File.Exists(file+".tmp"),"staging leftover");
+                          Require(MenuPreferences13.Decode(0,File.ReadAllBytes(file+".bak")).Music==.25f,"normal backup");
+                      });
+                      TestInFolder(root,"blocked staging leaves both saved records unchanged",p=>{
+                          MenuPreferences13.Save(p,0,new MenuPreferenceValues13{Music=.25f});MenuPreferences13.Save(p,0,new MenuPreferenceValues13{Music=.75f});
+                          string file=Path.Combine(p,"slot-0.bin");var a=File.ReadAllBytes(file);var b=File.ReadAllBytes(file+".bak");Directory.CreateDirectory(file+".tmp");
+                          bool rejected=false;try{MenuPreferences13.Save(p,0,new MenuPreferenceValues13{Music=.5f});}
+                          catch(Exception ex)when(ex is IOException||ex is UnauthorizedAccessException){rejected=true;}
+                          Require(rejected&&a.SequenceEqual(File.ReadAllBytes(file))&&b.SequenceEqual(File.ReadAllBytes(file+".bak")),"write protection");
+                      });
+                      Test("both known menu ZIP names and hashes accepted",()=>{
+                          foreach(string name in new[]{MenuSprites13.ZipName,MenuSprites13.LegacyZipName})
+                              foreach(string hash in new[]{MenuSprites13.ZipHash,MenuSprites13.LegacyZipHash})
+                                  Require(MenuSprites13.AcceptsArchive(name,MenuSprites13.ZipLength,hash),"known archive rejected");
+                      });
+                      Test("unknown menu ZIP name rejected",()=>Require(!MenuSprites13.AcceptsArchive("other.zip",MenuSprites13.ZipLength,MenuSprites13.ZipHash),"unknown name"));
+                      Test("tampered or truncated menu ZIP metadata rejected",()=>{
+                          Require(!MenuSprites13.AcceptsArchive(MenuSprites13.ZipName,MenuSprites13.ZipLength,new string('0',64)),"unknown hash");
+                          Require(!MenuSprites13.AcceptsArchive(MenuSprites13.ZipName,MenuSprites13.ZipLength-1,MenuSprites13.ZipHash),"short ZIP");
+                      });
+                      ILTests();
+                      Console.WriteLine("MENU13 TESTS COMPLETE: "+count+" PASS / "+failed+" FAIL. Synthetic helpers/IL fixture only; actual game menu, controller, art and Xbox UWP runtime are NOT tested here.");return failed==0?0:1;
+                  } catch(Exception e){Console.Error.WriteLine(e);return 1;} finally {Directory.Delete(root,true);}
+              }
+          }
+          ''', encoding='utf-8')
+      - name: Write repaired README.txt
+        shell: python
+        run: |
+          from pathlib import Path
+          path = Path('xbox-cmz-services') / 'README.txt'
+          path.parent.mkdir(parents=True, exist_ok=True)
+          path.write_text(r'''CMZ 0.13 REPAIR: MENU PREFERENCES + BOTH MENU-ART INPUT NAMES
+
+          The failed run 38637276047 stopped before UWP compilation in the backup-recovery
+          test. InvalidDataException was not covered by the file-I/O recovery catch. This
+          repair includes it explicitly, retains the last valid backup after a corrupt
+          primary, adds 11 related regression cases, and batches all five test suites.
+          A failing test still prevents any signed installer from being produced.
+
+          Either CastleMinerZ-menu-content.zip or CastleMinerZ-menu-sprites.zip previously
+          supplied is accepted, with exact known archive hashes and identical SpriteSheet
+          payload validation. No existing Xbox files or folders need to be removed.
+          The original-menu-only scope is unchanged; Play/gameplay and co-op are NOT ready.
+          No Xbox menu interaction or preference recovery has been verified by this repair.
+
+          Keep .github/workflows/xbox-cmz-startup.yml and branch Mousehook unchanged.
+          This remains package Name=NexiaCMZLoader, Publisher=CN=NexiaCMZLoader, x64,
+          version 0.13.<run>.0. Keep the current Xbox app installed in Game mode.
+          Only install an update after the Windows build succeeds and it is inspected.
+
+          Local validation: source generation, XML, source comparisons, original CLI
+          metadata and the two actual private sprite archives only. This environment has no .NET SDK; the repaired
+          C# suites, UWP build, and Xbox run have NOT run locally.
+
+          Previous 0.13 documentation follows; preparation-time statements remain historical.
+
+          CMZ ORIGINAL FRONT-END BUNDLE 0.13 — EXPLICIT MENU-ONLY DEVELOPMENT MODE
+
+          WHAT THE 0.12 XBOX TEST ESTABLISHES
+          The latest supplied log has 17 MODEL READY results, including PickAxe, tools and guns
+          through Colt. It next stops in TracerManager.Initialize at Effects/Tracer. Imported
+          models are constructed and checked, not yet visually tested in a game world.
+
+          WHY THIS IS A DIFFERENT, LARGER STEP
+          The original SecondaryLoad creates terrain, inventory, tracers, enemies and avatar
+          animations BEFORE FrontEndScreen. Its original main-selection handler also blocks
+          Options when world/avatar state is absent. Rather than pretend those systems work,
+          this bundle explicitly offers MENU ONLY as the default development mode. It is NOT
+          a Tracer implementation and does NOT complete the full original startup sequence.
+
+          MENU IMPLEMENTATION
+          - Preserves the original full SecondaryLoad method. A separate helper copies verified
+            straight-line original audio/UI-content/FrontEnd instructions, without gameplay
+            initialization, terrain generation or loading-screen waits. Original files stay intact.
+          - Executes the helper on the existing original Draw-thread queue. Uses the original
+            FrontEndScreen, SinglePlayerStartScreen, MainMenu, OptionsMenu, Controls and Settings;
+            original SpriteBatch drawing and original controller navigation remain in use.
+          - Converts SpriteSheet's embedded 812x1404 DXT5 texture, retaining all 17 original sprite
+            names/rectangles including Logo. No replacement logo/title artwork is fabricated.
+          - Runs a batch of independent font, texture, sprite and reflection-contract checks.
+            Failures are all logged before boot is rejected. No null assets or swallowed exceptions
+            are used to push through a failed constructor. Other game assets get a whole-pack
+            header/route inventory grouped by reader family; this is NOT runtime support proof.
+          - Original Start/A chooses the actual connected controller. The menu route joins an
+            offline local guest for that slot rather than invoking unimplemented Xbox sign-in.
+            It does NOT claim an authenticated Xbox account, avatar renderer or online privileges.
+          - Original selection events route Options/Controls/Settings and Back/return. Play,
+            awards, purchases, codes and destructive world-storage actions show an unavailable
+            dialog instead of entering unfinished code. Labels indicate those limitations.
+          - Uses the original engine's DNAGame Update and AfterLoad in menu mode, not incomplete
+            world-specific Update or InventoryItem.FinishInitialization. Original Draw is retained.
+          - Stores ONLY brightness, sensitivity, music volume and invert-Y preferences under
+            LocalState/MenuPreferences13 by controller slot, with checksums and backup recovery.
+            It never reads/writes original stats.sav, worlds, inventory, awards or entitlements.
+          - A small bottom banner identifies MENU ONLY. Click the right stick to expand/collapse
+            diagnostics. Original menu selection changes and input events are recorded in the
+            existing log. A Draw-return message is not proof the menu is visible or controllable.
+
+          FULL STARTUP STILL AVAILABLE
+          The default, when cmz-start-mode.txt is absent, is menu. For development only, a file
+          LocalState/cmz-start-mode.txt containing exactly full selects the existing full path.
+          That path still has unsupported Effects/Tracer and later game-content/services work.
+          It is NOT repaired merely by switching this option. The original handlers and lifecycle
+          are retained in full mode. Do not create this file for the normal menu test.
+
+          WHAT REMAINS UNIMPLEMENTED
+          Playable worlds, enemies/custom effects/animations, avatar rendering, full-version
+          license integration, online services and couch co-op. Trial-only policy is unchanged.
+          The terrain/water shaders remain experimental approximations. The menu-only mode is
+          an explicitly bounded milestone, NOT a finished game or a new standalone imitation menu.
+
+          BUILD/TEST LIMITS
+          MenuTests13 compiles the exact mode/selection policy, preference storage, atlas importer,
+          header check and IL-slice/handler patch helpers. It exercises synthetic fixtures and
+          executes patched fixture methods; it never downloads/runs original game content or a GPU.
+          All previous XACT/model/frame-queue/SpriteBatch tests and both shader checks also run.
+          The packager verifies menu hooks, queued boot and helper presence in the managed payload.
+          At preparation time no new C# build, UWP execution or controller/menu rendering test has
+          run. Local checks cover original IL stack balance, metadata names, shader-independent
+          SpriteBatch API signatures, sprite byte roundtrip and deterministic archive reproduction.
+
+          USER ACTION NOW
+          Replace ONLY the contents of .github/workflows/xbox-cmz-startup.yml on Mousehook using
+          the supplied complete workflow. Do not rename it or create another app/workflow.
+          There is no installer until the cloud build succeeds and its output is inspected.
+
+          INSTALLATION AFTER AN INSPECTED SUCCESSFUL BUILD
+          Update the same NexiaCMZLoader application to 0.13.<run>.0 WITHOUT uninstalling. Keep Game
+          mode. Existing Microsoft framework dependencies should be inspected, not blindly replaced.
+          Keep all five current LocalState ZIPs and extracted folders:
+            CastleMinerZ-assemblies.zip
+            CastleMinerZ-startup-content.zip
+            CastleMinerZ-music-pcm.zip
+            CastleMinerZ-terrain-textures.zip
+            CastleMinerZ-models-basic.zip
+          Add the one new CastleMinerZ-menu-sprites.zip INTACT alongside them. It is 316913 bytes,
+          about 317 KB. The app creates MenuContent13 itself. No other input needs replacing.
+          Do not put game/art/music ZIPs on GitHub or in the installer's dependency box.
+
+          XBOX ACCEPTANCE TEST (AFTER INSTALLATION)
+          Original title visible with original art/music -> Start/A -> D-pad selects Options ->
+          A opens Options -> Controls/Settings open -> B returns. Settings changes should affect
+          music/brightness and survive a relaunch for the same controller slot. No second controller
+          is required. Play must explicitly report unavailable, not pretend to start a world.
+          Return cmz-startup-log.txt and cmz-loader-log.txt before relaunch resets them. If the app
+          exits, saved logs are sufficient; repeated folder photographs are unnecessary.
+
+          SOURCE AND DATA
+          No original game executable, music, textures, font files or model binaries are included
+          in this source/workflow. The separate sprite ZIP is transformed user-supplied art only.
+          Prior notices/licenses are retained. The new menu helpers and tests are original port-
+          development code. No publisher endorsement or verified full-game compatibility is claimed.
+          ''', encoding='utf-8')
+      - name: Write repaired build.ps1
+        shell: python
+        run: |
+          from pathlib import Path
+          path = Path('xbox-cmz-services') / 'build.ps1'
+          path.parent.mkdir(parents=True, exist_ok=True)
+          path.write_text(r'''param([ValidateRange(1,65535)][int]$BuildNumber = 1)
+          $ErrorActionPreference = 'Stop'
+          Set-StrictMode -Version Latest
+          $root = $PSScriptRoot
+          $out = Join-Path $root 'out'
+          $packages = Join-Path $root 'AppPackages'
+          New-Item -ItemType Directory -Force $out, "$root\Assets", "$out\Dependencies", $packages | Out-Null
+          Start-Transcript -Path "$out\build-transcript.txt" -Force | Out-Null
+          try {
+              $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+              if (!(Test-Path $vswhere)) { throw 'Visual Studio locator is missing.' }
+              $vs = & $vswhere -latest -products '*' -version '[17.0,18.0)' -property installationPath
+              if (!$vs) { throw 'Visual Studio 2022 is required.' }
+              $msbuild = Join-Path $vs 'MSBuild\Current\Bin\MSBuild.exe'
+              $kits = "${env:ProgramFiles(x86)}\Windows Kits\10"
+              $versions = @(Get-ChildItem "$kits\bin" -Directory | Where-Object {
+                  $_.Name -match '^10\.0\.\d+\.0$' -and
+                  (Test-Path (Join-Path $_.FullName 'x64\makeappx.exe')) -and
+                  (Test-Path (Join-Path $_.FullName 'x64\signtool.exe'))
+              } | Sort-Object { [version]$_.Name } -Descending)
+              if (!$versions.Count) { throw 'Windows SDK packaging tools are missing.' }
+              $sdk = $versions[0].Name
+              if (@($versions | Where-Object Name -eq '10.0.19041.0').Count) { $sdk = '10.0.19041.0' }
+              Write-Host "Visual Studio: $vs"
+              Write-Host "SDK: $sdk; managed UWP Debug x64; .NET Native DISABLED intentionally"
+
+              Add-Type -AssemblyName System.Drawing
+              foreach ($asset in @(@('StoreLogo.png',50,50), @('Square44.png',44,44), @('Square150.png',150,150), @('Splash.png',620,300))) {
+                  $bitmap = [Drawing.Bitmap]::new([int]$asset[1], [int]$asset[2])
+                  $graphics = [Drawing.Graphics]::FromImage($bitmap)
+                  $brush = [Drawing.SolidBrush]::new([Drawing.Color]::FromArgb(230,180,70))
+                  try {
+                      $graphics.Clear([Drawing.Color]::FromArgb(16,24,32))
+                      $graphics.FillRectangle($brush, [int]($asset[1]/4), [int]($asset[2]/4), [int]($asset[1]/2), [int]($asset[2]/2))
+                      $bitmap.Save((Join-Path "$root\Assets" $asset[0]), [Drawing.Imaging.ImageFormat]::Png)
+                  } finally { $brush.Dispose(); $graphics.Dispose(); $bitmap.Dispose() }
+              }
+              [xml]$manifest = Get-Content "$root\Package.appxmanifest" -Raw
+              $manifest.Package.Identity.Version = "0.13.$BuildNumber.0"
+              $manifest.Package.Dependencies.TargetDeviceFamily.MaxVersionTested = $sdk
+              $manifest.Save("$root\Package.appxmanifest")
+
+              # Collect independent suite failures in one cloud run instead of aborting on the first.
+              $testResults = @()
+              $testSuites = @(
+                  @{ Project = 'MenuTests13\MenuTests13.csproj'; Log = 'menu13-unit-tests.log' },
+                  @{ Project = 'XactTests\XactTests.csproj'; Log = 'xact-unit-tests.log' },
+                  @{ Project = 'Startup09Tests\Startup09Tests.csproj'; Log = 'startup09-unit-tests.log' },
+                  @{ Project = 'FrameWorkTests11\FrameWorkTests11.csproj'; Log = 'frame-work-tests11.log' },
+                  @{ Project = 'ModelTests12\ModelTests12.csproj'; Log = 'model-tests12.log' }
+              )
+              foreach ($suite in $testSuites) {
+                  & dotnet run --project (Join-Path $root $suite.Project) --configuration Release 2>&1 | Tee-Object -FilePath (Join-Path $out $suite.Log)
+                  $testResults += [pscustomobject]@{ Project = $suite.Project; ExitCode = $LASTEXITCODE; Log = $suite.Log }
+              }
+              $testResults | ConvertTo-Json | Set-Content "$out\all-test-results.json"
+              $testFailures = @($testResults | Where-Object { $_.ExitCode -ne 0 })
+              # Compile the actual app too, so independent C# errors are collected in this same run.
+              # The unsigned intermediates stay outside out/; the failure gate precedes all signing.
+              # Pin the effects compiler to the runtime's exact MonoGame release.
+              $env:DOTNET_ROLL_FORWARD = 'Major'
+              & dotnet tool install dotnet-mgfxc --version 3.8.1.303 --tool-path "$root\effect-tools" --configfile "$root\NuGet.Config"
+              if ($LASTEXITCODE -ne 0) { throw 'Pinned effects compiler installation failed.' }
+              New-Item -ItemType Directory -Force "$root\CompiledEffects10" | Out-Null
+              & "$root\effect-tools\mgfxc.exe" "$root\Effects10\BlockEffect.fx" "$root\CompiledEffects10\BlockEffect.mgfxo" /Profile:DirectX_11 2>&1 | Tee-Object -FilePath "$out\terrain-shader-compile.log"
+              if ($LASTEXITCODE -ne 0) { throw 'Terrain effect compilation failed. No package will be published.' }
+              & python "$root\EffectChecks10\verify_effect.py" "$root\CompiledEffects10\BlockEffect.mgfxo" "$root\EffectChecks10\contract.json" 2>&1 | Tee-Object -FilePath "$out\terrain-effect-contract.log"
+              if ($LASTEXITCODE -ne 0) { throw 'Compiled terrain effect contract check failed. No package will be published.' }
+              New-Item -ItemType Directory -Force "$root\CompiledEffects11" | Out-Null
+              & "$root\effect-tools\mgfxc.exe" "$root\Effects11\WaterEffect.fx" "$root\CompiledEffects11\WaterEffect.mgfxo" /Profile:DirectX_11 2>&1 | Tee-Object -FilePath "$out\water-shader-compile.log"
+              if ($LASTEXITCODE -ne 0) { throw 'Water effect compilation failed. No package will be published.' }
+              & python "$root\EffectChecks11\verify_water.py" "$root\CompiledEffects11\WaterEffect.mgfxo" "$root\EffectChecks11\contract.json" 2>&1 | Tee-Object -FilePath "$out\water-effect-contract.log"
+              if ($LASTEXITCODE -ne 0) { throw 'Water effect contract check failed. No package will be published.' }
+              & $msbuild "$root\ManagedProbe.csproj" /restore /m /t:Build /v:minimal `
+                  /p:Configuration=Debug /p:Platform=x64 "/p:TargetPlatformVersion=$sdk" `
+                  /p:UseDotNetNativeToolchain=false /p:AppxPackageSigningEnabled=false `
+                  /p:GenerateAppxPackageOnBuild=true /p:AppxBundle=Never `
+                  /p:UapAppxPackageBuildMode=SideloadOnly "/p:AppxPackageDir=$packages\" `
+                  "/flp:LogFile=$out\msbuild.log;Verbosity=normal" `
+                  "/bl:$out\build.binlog"
+              if ($LASTEXITCODE -ne 0) { throw "Managed UWP build failed ($LASTEXITCODE). See build.binlog and transcript." }
+              if ($testFailures.Count -gt 0) { throw ("Test suites failed: " + (($testFailures | ForEach-Object { $_.Project }) -join ", ") + ". See all-test-results.json. No signed installer will be produced.") }
+
+              Get-ChildItem $packages -Recurse -File | Select-Object FullName,Length | Format-Table -AutoSize | Out-String -Width 300 | Set-Content "$out\package-inventory.txt"
+              $apps = @(Get-ChildItem $packages -Recurse -File | Where-Object {
+                  $_.Extension -in @('.appx', '.msix') -and $_.FullName -notmatch '[\\/]Dependencies[\\/]'
+              })
+              if ($apps.Count -ne 1) { throw "Expected one main APPX; found $($apps.Count)." }
+              $package = Join-Path $root "NexiaCMZLoader_0.13.${BuildNumber}.0_x64$($apps[0].Extension)"
+              # Modify only this unsigned app's copy of MonoGame, then regenerate package metadata.
+              # No installed framework package, original game file or OS file is modified.
+              $stage = Join-Path $root 'startup-package-stage'
+              if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
+              & "$kits\bin\$sdk\x64\makeappx.exe" unpack /p $apps[0].FullName /d $stage /o
+              if ($LASTEXITCODE -ne 0) { throw 'Could not unpack unsigned startup package.' }
+              & dotnet run --project "$root\PackagingTool\PackagingTool.csproj" --configuration Release -- $stage 2>&1 | Tee-Object -FilePath "$out\packaging-patch-checks.log"
+              if ($LASTEXITCODE -ne 0) { throw 'Private MonoGame file bridge patch failed.' }
+              foreach ($metadata in @('AppxBlockMap.xml', '[Content_Types].xml', 'AppxSignature.p7x', 'AppxMetadata\CodeIntegrity.cat')) {
+                  $file = Join-Path $stage $metadata
+                  if (Test-Path -LiteralPath $file) { Remove-Item -LiteralPath $file -Force }
+              }
+              & "$kits\bin\$sdk\x64\makeappx.exe" pack /d $stage /p $package /o
+              if ($LASTEXITCODE -ne 0) { throw 'Could not repack unsigned startup package.' }
+              $dependencyFiles = @(Get-ChildItem $packages -Recurse -File | Where-Object {
+                  $_.Extension -in @('.appx', '.msix') -and $_.FullName -match '[\\/]Dependencies[\\/]' -and $_.FullName -match '[\\/](x64|neutral)[\\/]'
+              })
+              foreach ($dependency in $dependencyFiles) {
+                  Copy-Item $dependency.FullName (Join-Path "$out\Dependencies" $dependency.Name) -Force
+              }
+
+              # Fail visibly if a declared dependency is not included. Do not substitute
+              # a desktop .NET runtime or assume it is already installed on the Xbox.
+              Add-Type -AssemblyName System.IO.Compression.FileSystem
+              function Read-AppxManifest([string]$Path) {
+                  $archive = [IO.Compression.ZipFile]::OpenRead($Path)
+                  try {
+                      $entry = $archive.GetEntry('AppxManifest.xml')
+                      if (!$entry) { throw "Missing APPX manifest: $Path" }
+                      $reader = [IO.StreamReader]::new($entry.Open())
+                      try { return [xml]$reader.ReadToEnd() } finally { $reader.Dispose() }
+                  } finally { $archive.Dispose() }
+              }
+              $contentsCheck = [IO.Compression.ZipFile]::OpenRead($package)
+              try {
+                  foreach ($requiredFile in @('MonoGame.Framework.dll', 'Mono.Cecil.dll')) {
+                      if (!$contentsCheck.GetEntry($requiredFile)) { throw "Required assembly missing: $requiredFile" }
+                  }
+                  foreach ($entry in $contentsCheck.Entries) {
+                      if ($entry.FullName -match '(^|[/\\])(CastleMinerZ\.exe|DNA\.Common\.dll|CastleMinerZ-assemblies\.zip|CastleMinerZ-startup-content\.zip|CastleMinerZ-music-pcm\.zip|CastleMinerZ-terrain-textures\.zip|Textures\.xnb|SoundsStreaming\.pcm\.xwb)$') {
+                          throw 'Original game files must not be in the public build artifact.'
+                      }
+                  }
+              } finally { $contentsCheck.Dispose() }
+              $mainManifest = Read-AppxManifest $package
+              if ($mainManifest.Package.Identity.Name -ne 'NexiaCMZLoader' -or
+                  $mainManifest.Package.Identity.Publisher -ne 'CN=NexiaCMZLoader' -or
+                  $mainManifest.Package.Identity.ProcessorArchitecture -ne 'x64') {
+                  throw 'Unexpected package identity, publisher or architecture.'
+              }
+              $available = @{}
+              foreach ($file in @(Get-ChildItem "$out\Dependencies" -File | Where-Object { $_.Extension -in @('.appx', '.msix') })) {
+                  $dependencyManifest = Read-AppxManifest $file.FullName
+                  $identity = $dependencyManifest.Package.Identity
+                  $available[[string]$identity.Name] = [version]$identity.Version
+                  Write-Host "Included dependency: $($identity.Name) $($identity.Version)"
+              }
+              $required = @($mainManifest.SelectNodes('//*[local-name()="PackageDependency"]'))
+              foreach ($dependency in $required) {
+                  $name = $dependency.GetAttribute('Name')
+                  $minimum = [version]$dependency.GetAttribute('MinVersion')
+                  if (!$available.ContainsKey($name) -or $available[$name] -lt $minimum) {
+                      throw "Missing packaged dependency: $name >= $minimum. Return the build logs; do not install random runtime files."
+                  }
+              }
+              if (@($required | Where-Object { $_.GetAttribute('Name') -like 'Microsoft.NET.Native*' }).Count) {
+                  throw 'This diagnostic unexpectedly targets .NET Native rather than the intended managed runtime.'
+              }
+              if (!@($required | Where-Object { $_.GetAttribute('Name') -like 'Microsoft.NET.CoreRuntime*' }).Count) {
+                  throw 'Expected a UWP CoreRuntime dependency; inspect the manifest before testing.'
+              }
+              $mainManifest.OuterXml | Set-Content "$out\packaged-manifest.xml" -Encoding utf8
+
+              $cert = New-SelfSignedCertificate -Type Custom -Subject 'CN=NexiaCMZLoader' `
+                  -KeyUsage DigitalSignature -KeyAlgorithm RSA -KeyLength 2048 -HashAlgorithm SHA256 `
+                  -CertStoreLocation 'Cert:\CurrentUser\My' `
+                  -TextExtension @('2.5.29.37={text}1.3.6.1.5.5.7.3.3') -NotAfter (Get-Date).AddMonths(6)
+              try {
+                  & "$kits\bin\$sdk\x64\signtool.exe" sign /fd SHA256 /s My /sha1 $cert.Thumbprint $package
+                  if ($LASTEXITCODE -ne 0) { throw 'APPX signing failed.' }
+                  Export-Certificate -Cert $cert -FilePath "$out\NexiaCMZLoader.cer" | Out-Null
+              } finally { Remove-Item "Cert:\CurrentUser\My\$($cert.Thumbprint)" -ErrorAction SilentlyContinue }
+              Copy-Item "$root\MONOGAME-LICENSE.txt" $out
+              Copy-Item "$root\SOURCE-PROVENANCE.json" $out
+              Copy-Item $package $out
+              Copy-Item "$root\README.txt", "$root\NEXIA-LICENSE.txt", "$root\THIRD-PARTY-NOTICES.txt" $out
+              Get-FileHash $package -Algorithm SHA256 | Format-List | Out-File "$out\SHA256.txt"
+              Write-Host 'CMZ 0.13 UPDATE BUILT. Converted-model loading and graphics behavior still need Xbox testing.'
+          } finally { Stop-Transcript | Out-Null }
+          ''', encoding='utf-8')
+      - name: Write repaired REPAIR13.json
+        shell: python
+        run: |
+          from pathlib import Path
+          path = Path('xbox-cmz-services') / 'REPAIR13.json'
+          path.parent.mkdir(parents=True, exist_ok=True)
+          path.write_text(r'''{
+            "failed_run": 38637276047,
+            "failed_commit": "215a65b3caad70bd432616075e755979fb4e0aff",
+            "changes": [
+              "MenuPreferences13.cs",
+              "MenuSprites13.cs",
+              "MenuTests13/MenuTests13.csproj",
+              "MenuTests13/Program.cs",
+              "README.txt",
+              "build.ps1"
+            ],
+            "new_regression_cases": 11,
+            "new_CSharp_tests_run": false,
+            "new_Windows_build_run": false,
+            "new_Xbox_run": false
+          }''', encoding='utf-8')
+      - name: Run all regression suites, compile app and sign only after success
+        shell: pwsh
+        env:
+          PROBE_BUILD_NUMBER: ${{ github.run_number }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tokens = $null
+          $parseErrors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            "$PWD/xbox-cmz-services/build.ps1", [ref]$tokens, [ref]$parseErrors
+          ) | Out-Null
+          if ($parseErrors.Count -gt 0) { throw ($parseErrors | Out-String) }
+          ./xbox-cmz-services/build.ps1 -BuildNumber ([int]$env:PROBE_BUILD_NUMBER)
+
+      - name: Upload checked installer or complete failure logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: XboxCMZStartup-x64-${{ github.run_number }}
+          path: xbox-cmz-services/out/
+          retention-days: 7
+          if-no-files-found: warn
