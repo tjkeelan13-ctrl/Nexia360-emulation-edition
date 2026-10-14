@@ -1,0 +1,1609 @@
+# Replace CONTENTS of the existing .github/workflows/xbox-cmz-startup.yml only.
+# No original game binaries or audio files belong in this public workflow.
+name: Xbox - CMZ Original Startup
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [Mousehook]
+    paths:
+      - '.github/workflows/xbox-cmz-startup.yml'
+
+permissions:
+  contents: read
+concurrency:
+  group: xbox-cmz-startup-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 25
+    steps:
+      - name: Recover pinned successful 0.8 sources
+        shell: python
+        run: |
+          import hashlib, re, textwrap
+          from urllib.request import urlopen
+          url = ('https://raw.githubusercontent.com/tjkeelan13-ctrl/'
+                 'Nexia360-emulation-edition/52aec9318b2deb8d7e123edd5419748d868cffce/'
+                 '.github/workflows/xbox-cmz-startup.yml')
+          with urlopen(url, timeout=45) as response:
+              data = response.read()
+          if hashlib.sha256(data).hexdigest() != 'fe82669f9760b7ec5be576ca019ac916887629b17dad19a219a027c5c704868e':
+              raise RuntimeError('Pinned 0.8 source integrity mismatch')
+          blocks = re.findall(r'(?m)^        shell: python\n        run: \|\n((?: {10}.*\n|\n)*)', data.decode('utf-8-sig'))
+          if len(blocks) != 9:
+              raise RuntimeError('Unexpected 0.8 source-generation structure')
+          for block in blocks:
+              exec(compile(textwrap.dedent(block), 'verified-startup08-source', 'exec'), {})
+          print('Recovered 0.8 source; applying original 0.9 adapters. No game content was fetched.')
+      - name: Write App.xaml.cs (1/1)
+        shell: python
+        run: |
+          from pathlib import Path
+          path = Path("xbox-cmz-services") / 'App.xaml.cs'
+          path.parent.mkdir(parents=True, exist_ok=True)
+          with path.open('w', encoding="utf-8", newline="") as output:
+              output.write(r'''using System;
+          using System.IO;
+          using System.Threading.Tasks;
+          using Microsoft.Xna.Framework;
+          using Windows.ApplicationModel.Activation;
+          using Windows.Storage;
+          using Windows.UI.Xaml;
+          using Windows.UI.Xaml.Controls;
+          using Windows.UI.Xaml.Media;
+
+          namespace NexiaCMZLoader {
+              sealed partial class App : Application {
+                  private bool launched,started;
+                  private Game game;
+                  private DispatcherTimer timer;
+                  public App() {
+                      InitializeComponent();
+                      RequiresPointerMode=ApplicationRequiresPointerMode.WhenRequested;
+                      UnhandledException+=(sender,e)=>StartupHooks.Stop(e.Exception,"unhandled XAML exception");
+                      TaskScheduler.UnobservedTaskException+=(sender,e)=>StartupHooks.Stop(e.Exception,"unobserved task exception");
+                  }
+                  protected override void OnLaunched(LaunchActivatedEventArgs args) {
+                      if(launched){Window.Current.Activate();return;}launched=true;
+                      string folder=ApplicationData.Current.LocalFolder.Path;
+                      StartupHooks.Begin(folder);
+                      var panel=new SwapChainPanel();
+                      var text=new TextBlock{FontSize=18,TextWrapping=TextWrapping.Wrap,Margin=new Thickness(12),
+                          Foreground=new SolidColorBrush(Windows.UI.Colors.White)};
+                      var scroller=new ScrollViewer{Content=text,VerticalScrollBarVisibility=ScrollBarVisibility.Auto};
+                      var overlay=new Border{Child=scroller,Background=new SolidColorBrush(Windows.UI.Color.FromArgb(220,9,16,24)),
+                          Margin=new Thickness(32,20,32,0),VerticalAlignment=VerticalAlignment.Top,MaxHeight=320};
+                      var grid=new Grid();grid.Children.Add(panel);grid.Children.Add(overlay);
+                      panel.Loaded+=async (sender,eventArgs)=>{
+                          if(started)return;started=true;
+                          try {
+                              var loader=new CmzLoader(folder);
+                              string results=await Task.Run(()=>loader.Run());
+                              StartupHooks.Note(results);
+                              if(loader.StartupGameType==null) throw new InvalidOperationException("Game type was not prepared. See cmz-loader-log.txt.");
+                              // Requiring the verified content input avoids a known, pointless missing-Debug-font run.
+                              await Task.Run(()=>{ StartupFiles.ImportContent(folder); ResidentMusic.Import(folder); });
+                              StartupFiles.GameAssembly=loader.StartupGameType.Assembly;
+                              StartupFiles.EngineAssembly=loader.EngineAssembly;
+                              StartupHooks.BeforeConstruction(StartupFiles.GameAssembly,StartupFiles.EngineAssembly);
+                              StartupHooks.Note("ATTEMPTING original constructor and lifecycle; errors will be recorded, not hidden.");
+                              game=MonoGame.Framework.XamlGame<Game>.Create(()=>{
+                                  var actual=(Game)Activator.CreateInstance(loader.StartupGameType);
+                                  StartupHooks.AfterConstruction(actual);
+                                  return actual;
+                              },args.Arguments??"",Window.Current.CoreWindow,panel);
+                              StartupHooks.Note("Original game handed to UWP loop. This message alone does not prove successful initialization.");
+                          } catch(Exception error) { StartupHooks.Stop(error,"startup host"); }
+                      };
+                      timer=new DispatcherTimer{Interval=TimeSpan.FromMilliseconds(250)};
+                      timer.Tick+=(sender,e)=>text.Text=StartupHooks.Snapshot();timer.Start();
+                      Window.Current.Content=grid;Window.Current.Activate();
+                  }
+              }
+          }
+          ''')
+      - name: Write CmzLoader.cs (1/2)
+        shell: python
+        run: |
+          from pathlib import Path
+          path = Path("xbox-cmz-services") / 'CmzLoader.cs'
+          path.parent.mkdir(parents=True, exist_ok=True)
+          with path.open('w', encoding="utf-8", newline="") as output:
+              output.write(r'''// Read-only original inputs; retargeted copies belong to this test app only.
+          // This preparation class does not execute the game. The 0.9 startup host calls the original constructor/lifecycle afterward.
+          using System;
+          using System.Collections.Generic;
+          using System.IO;
+          using System.IO.Compression;
+          using System.Linq;
+          using System.Reflection;
+          using System.Security.Cryptography;
+          using Mono.Cecil;
+          using Windows.System.Profile;
+
+          namespace NexiaCMZLoader
+          {
+              internal sealed class CmzLoader
+              {
+                  private readonly string folder;
+                  private readonly string logPath;
+                  private readonly List<string> summary = new List<string>();
+                  private readonly List<Assembly> providers = new List<Assembly>();
+                  private readonly Dictionary<string, Type> typeCache = new Dictionary<string, Type>();
+                  private readonly HashSet<string> unresolved = new HashSet<string>();
+                  private object context;
+                  private MethodInfo loadStream;
+                  private int mapped;
+                  internal Type StartupGameType { get; private set; }
+                  internal Assembly EngineAssembly { get; private set; }
+
+                  internal CmzLoader(string localFolder)
+                  {
+                      folder = localFolder;
+                      logPath = Path.Combine(folder, "cmz-loader-log.txt");
+                  }
+                  private void Log(string text) { File.AppendAllText(logPath, text + "\r\n"); }
+                  private void Show(string text) { summary.Add(text); Log(text); }
+                  internal string Run()
+                  {
+                      File.WriteAllText(logPath, "CMZ assembly check " + DateTime.UtcNow.ToString("O") + "\r\n");
+                      Show("CASTLEMINER Z ASSEMBLY SERVICES PREPARATION 0.9 - NOT PLAYABLE");
+                      Show("Device: " + AnalyticsInfo.VersionInfo.DeviceFamily);
+                      Log("Runtime: " + typeof(object).Assembly.FullName);
+                      Log("Couch co-op requirement: two independent local players sharing one world. NOT implemented here.");
+                      string zipPath = Path.Combine(folder, "CastleMinerZ-assemblies.zip");
+                      if (!File.Exists(zipPath)) {
+                          Show("WAITING FOR YOUR GAME FILES");
+                          Show("Upload CastleMinerZ-assemblies.zip into this app's LocalState.");
+                          Show("Keep the ZIP intact, then fully close and reopen this app.");
+                          return string.Join("\n", summary);
+                      }
+                      try {
+                          string originals = Path.Combine(folder, "OriginalAssemblies");
+                          string prepared = Path.Combine(folder, "PreparedAssemblies");
+                          Directory.CreateDirectory(originals);
+                          Directory.CreateDirectory(prepared);
+                          Import(zipPath, originals);
+                          Show("Original CastleMinerZ.exe + DNA.Common.dll: verified");
+                          DiscoverContext();
+                          Show("Public stream loader: available");
+                          try { Show("Offline services: " + LocalServiceTests.Run(folder)); }
+                          catch (Exception serviceError) { Show("Offline service self-test FAILED: " + serviceError.GetType().Name); Log(serviceError.ToString()); }
+                          Show("Avatar / online / guide UI APIs are guarded declarations, NOT implemented services.");
+                          AddProvider(typeof(LocalServiceTests).Assembly);
+                          AddProvider(typeof(object).Assembly);
+                          AddProvider(typeof(Enumerable).Assembly);
+                          AddProvider(typeof(File).Assembly);
+                          AddProvider(typeof(Uri).Assembly);
+                          AddProvider(typeof(System.Threading.Thread).Assembly);
+                          AddProvider(typeof(Microsoft.Xna.Framework.Game).Assembly);
+                          foreach (string name in new[] { "System.Runtime", "System.Collections", "System.Linq",
+                              "System.IO", "System.Reflection", "System.Threading", "System.Threading.Tasks",
+                              "System.Xml.ReaderWriter", "System.Xml.XDocument", "System.Net.Primitives",
+                              "System.Net.Sockets", "System.Runtime.Extensions", "System.Globalization",
+                              "System.Console", "System.Threading.Thread", "System.Text.RegularExpressions",
+                              "System.Diagnostics.Tools", "System.IO.IsolatedStorage", "System.ComponentModel.Primitives" }) {
+                              try { AddProvider(Assembly.Load(new AssemblyName(name))); }
+                              catch (Exception ex) { Log("Optional type provider " + name + ": " + ex.Message); }
+                          }
+                          string[] names = { "DNA.Common.dll", "CastleMinerZ.exe" };
+                          foreach (string name in names) {
+                              Retarget(Path.Combine(originals, name), Path.Combine(prepared, name));
+                          }
+                          Show("Framework type references mapped: " + mapped + " (includes guarded declarations)");
+                          Show("Unresolved framework type names: " + unresolved.Count + " (details in log)");
+                          foreach (string missing in unresolved.OrderBy(x => x)) Log("UNMAPPED " + missing);
+                          var loaded = new Dictionary<string, Assembly>();
+                          foreach (string name in names) {
+                              try {
+                                  Assembly assembly;
+                                  using (var stream = new MemoryStream(File.ReadAllBytes(Path.Combine(prepared, name))))
+                                      assembly = (Assembly)loadStream.Invoke(context, new object[] { stream });
+                                  loaded.Add(name, assembly);
+                              if(name=="DNA.Common.dll") EngineAssembly=assembly;
+                                  Show(name + ": assembly loaded");
+                                  Log("Loaded identity: " + assembly.FullName);
+                                  InspectTypes(name, assembly);
+                                  InspectSignatures(name, assembly);
+                              } catch (Exception ex) {
+                                  ex = Unwrap(ex);
+                                  Show(name + ": LOAD FAILED " + ex.GetType().Name);
+                                  Log(ex.ToString());
+                              }
+                          }
+                          Assembly game;
+                          if (loaded.TryGetValue("CastleMinerZ.exe", out game)) {
+                              try {
+                                  Type type = game.GetType("DNA.CastleMinerZ.CastleMinerZGame", true);
+                                  bool correctBase = typeof(Microsoft.Xna.Framework.Game).IsAssignableFrom(type);
+                                  Show("Actual game class linked to MonoGame: " + correctBase);
+                                  Log("Game constructors: " + string.Join("; ", type.GetConstructors().Select(c => c.ToString())));
+                              if(correctBase) StartupGameType=game.GetType("NexiaStartup.OriginalGame",true);
+                              } catch (Exception ex) {
+                                  ex = Unwrap(ex);
+                                  Show("Actual game class: BLOCKED " + ex.GetType().Name);
+                                  Log(ex.ToString());
+                              }
+                          }
+                          Show("ASSEMBLY PREPARATION COMPLETE - original startup will be attempted by the host if the content ZIP is present. Avatars/couch gameplay remain unimplemented.");
+                          Show("Send this screen and LocalState/cmz-loader-log.txt.");
+                      } catch (Exception ex) {
+                          ex = Unwrap(ex);
+                          Show("CHECK STOPPED: " + ex.GetType().Name + ": " + ex.Message);
+                          Log(ex.ToString());
+                          Show("Send LocalState/cmz-loader-log.txt. Do not replace system runtime files.");
+                      }
+                      return string.Join("\n", summary);
+                  }
+                  private void Import(string zipPath, string destination)
+                  {
+                      var hashes = new Dictionary<string, string>(StringComparer.Ordinal) {
+                          { "CastleMinerZ.exe", "e378b91ed3c088e8d89094213e5eb064737957c05164ae84a22e4fc766f903a4" },
+                          { "DNA.Common.dll", "642853463e0bbdf310ee88956af41cb5c2db5814a12255674ed61e383f8b3d59" }
+                      };
+                      if (new FileInfo(zipPath).Length > 4 * 1024 * 1024)
+                          throw new InvalidDataException("Expected the small two-assembly ZIP, not an entire game archive.");
+                      using (var input = File.OpenRead(zipPath))
+                      using (var archive = new ZipArchive(input, ZipArchiveMode.Read)) {
+                          if (archive.Entries.Count != 2) throw new InvalidDataException("Expected exactly two original assemblies.");
+                          var seen = new HashSet<string>(StringComparer.Ordinal);
+                          foreach (var entry in archive.Entries) {
+                              string expected;
+                              if (!hashes.TryGetValue(entry.FullName, out expected) || !seen.Add(entry.FullName))
+                                  throw new InvalidDataException("Unexpected or duplicate ZIP entry: " + entry.FullName);
+                              long expectedLength = entry.FullName == "CastleMinerZ.exe" ? 439296 : 610304;
+                              if (entry.Length != expectedLength) throw new InvalidDataException("Original assembly size mismatch.");
+                              var bytes = new byte[(int)expectedLength];
+                              using (var stream = entry.Open()) {
+                                  int offset = 0;
+                                  while (offset < bytes.Length) {
+                                      int count = stream.Read(bytes, offset, bytes.Length - offset);
+                                      if (count == 0) throw new EndOfStreamException("Incomplete game assembly in ZIP.");
+                                      offset += count;
+                                  }
+                                  if (stream.ReadByte() != -1) throw new InvalidDataException("Oversized ZIP entry.");
+                              }
+                              string actual;
+                              using (var hash = SHA256.Create())
+                                  actual = BitConverter.ToString(hash.ComputeHash(bytes)).Replace("-", "").ToLowerInvariant();
+                              if (actual != expected) throw new InvalidDataException("Game assembly hash mismatch: " + entry.FullName);
+                              File.WriteAllBytes(Path.Combine(destination, entry.FullName), bytes);
+                              Log("Original verified: " + entry.FullName + " " + actual);
+                          }
+                      }
+                  }
+                  private void DiscoverContext()
+                  {
+                      Type type = typeof(object).Assembly.GetType("System.Runtime.Loader.AssemblyLoadContext");
+                      if (type == null || !type.IsPublic) throw new NotSupportedException("Public load context unavailable.");
+                      var property = type.GetProperty("Default", BindingFlags.Public | BindingFlags.Static);
+                      context = property == null ? null : property.GetValue(null);
+                      loadStream = type.GetMethod("LoadFromStream", BindingFlags.Public | BindingFlags.Instance,
+                          null, new Type[] { typeof(Stream) }, null);
+                      if (context == null || loadStream == null) throw new NotSupportedException("Public stream loading unavailable.");
+                      Log("Context: " + context.GetType().FullName);
+                  }
+                  private void AddProvider(Assembly assembly)
+                  {
+                      if (!providers.Contains(assembly)) providers.Add(assembly);
+                  }
+                  private static bool PublicType(Type type) { return type != null && (type.IsPublic || type.IsNestedPublic); }
+                  private Type RuntimeType(string name, bool xna)
+                  {
+                      string key = (xna ? "XNA:" : "BCL:") + name;
+                      Type cached;
+                      if (typeCache.TryGetValue(key, out cached)) return cached;
+                      string full = name.Replace('/', '+');
+                      // A non-public CoreLib lookalike must not stop the search for a public facade type.
+                      var candidates = xna
+                          ? new [] { typeof(LocalServiceTests).Assembly, typeof(Microsoft.Xna.Framework.Game).Assembly }
+                          : providers.ToArray();
+                      foreach (var provider in candidates) {
+                          Type type = null;
+                          try { type = provider.GetType(full, false); }
+                          catch (Exception ex) { Log("TYPE PROVIDER " + provider.GetName().Name + " " + full + ": " + ex.Message); }
+                          if (!PublicType(type)) continue;
+                          typeCache[key] = type;
+                          Log("MAP " + key + " -> " + type.Assembly.GetName().Name);
+                          return type;
+                      }
+                      if (!xna) {
+                          Type type = Type.GetType(full, false);
+                          if (PublicType(type)) { typeCache[key]=type; return type; }
+                      }
+                      typeCache[key]=null;
+                      return null;
+                  }
+                  private void Retarget(string original, string output)
+                  {
+                      using (var definition = AssemblyDefinition.ReadAssembly(original, new ReaderParameters {
+                          ReadingMode = ReadingMode.Deferred, ReadSymbols = false
+                      })) {
+                          var module = definition.MainModule;
+                          if ((module.Attributes & ModuleAttributes.ILOnly) == 0)
+                              throw new NotSupportedException("Only pure managed IL is accepted.");
+                          Log("Original " + Path.GetFileName(original) + " metadata " + module.RuntimeVersion);
+                          foreach (var reference in module.AssemblyReferences) Log("Assembly reference: " + reference.FullName);
+                          // Rewrite copies only. Unknown APIs remain unknown rather than being replaced with no-op stubs.
+                          // Capture original scopes first: rewriting a parent must not hide a nested reference.
+                          var references = module.GetTypeReferences().Select(reference => {
+                              TypeReference outer = reference;
+                              while (outer.DeclaringType != null) outer=outer.DeclaringType;
+                              var scope = outer.Scope as AssemblyNameReference;
+                              return new { Reference=reference, Outer=outer, Name=reference.FullName,
+                                  Source=scope == null ? "" : scope.Name };
+                          }).ToArray();
+                          foreach (var item in references) {
+                              bool xna=item.Source.StartsWith("Microsoft.Xna.Framework",StringComparison.Ordinal);
+                              bool bcl=item.Source=="mscorlib" || item.Source=="System" || item.Source=="System.Core";
+                              if (!xna && !bcl) continue;
+                              if(xna && RuntimePatches.RemapType(item.Reference,module,Log)) { mapped++; continue; }
+                          Type type=RuntimeType(item.Name,xna);
+                              if (type==null) { unresolved.Add(item.Source + " :: " + item.Name); continue; }
+                              var imported=module.ImportReference(type);
+                              item.Outer.Scope=imported.Scope;
+                              item.Reference.Scope=imported.Scope;
+                              mapped++;
+                          }
+                          // Original CF binary is IL-only; target the CLR metadata used by this experimental host.
+                          module.RuntimeVersion = "v4.0.30319";
+                          module.Attributes &= ~ModuleAttributes.Required32Bit;
+                          module.Attributes &= ~ModuleAttributes.Preferred32Bit;
+                          RuntimePatches.Apply(module,Log);
+                      definition.Write(output);
+                          Log("Wrote retargeted app-local copy: " + Path.GetFileName(output));
+                      }
+                  }
+                  private void InspectTypes(string name, Assembly assembly)
+                  {
+                      try {
+                          var types = assembly.GetTypes();
+                          Show(name + ": " + types.Length + " types linked");
+                      } catch (ReflectionTypeLoadException ex) {
+                          int available = ex.Types.Count(t => t != null);
+                          Show(name + ": " + available + "/" + ex.Types.Length + " types linked; missing APIs in log");
+                          foreach (var error in ex.LoaderExceptions.Where(e => e != null)
+                              .Select(e => e.ToString()).Distinct()) Log("TYPE LOAD ERROR " + error);
+                      } catch (Exception ex) {
+                          Show(name + ": type inspection failed " + ex.GetType().Name);
+                          Log(ex.ToString());
+                      }
+                  }
+                  private void InspectSignatures(string name, Assembly assembly) {
+                      Type[] types;
+                      try { types=assembly.GetTypes(); }
+          ''')
+      - name: Write CmzLoader.cs (2/2)
+        shell: python
+        run: |
+          from pathlib import Path
+          path = Path("xbox-cmz-services") / 'CmzLoader.cs'
+          path.parent.mkdir(parents=True, exist_ok=True)
+          with path.open('a', encoding="utf-8", newline="") as output:
+              output.write(r'''            catch (ReflectionTypeLoadException ex) { types=ex.Types.Where(t=>t!=null).ToArray(); }
+                      int good=0, bad=0;
+                      var flags=BindingFlags.Public|BindingFlags.NonPublic|BindingFlags.Instance|BindingFlags.Static|BindingFlags.DeclaredOnly;
+                      foreach(var type in types) {
+                          try {
+                              foreach(var field in type.GetFields(flags)) { var fieldType=field.FieldType; good++; }
+                          } catch(Exception ex) { bad++;Log("FIELD SIGNATURE " + type.FullName + " " + Unwrap(ex)); }
+                          MethodBase[] methods;
+                          try { methods=type.GetMethods(flags).Cast<MethodBase>().Concat(type.GetConstructors(flags)).ToArray(); }
+                          catch(Exception ex) { bad++;Log("METHOD ENUMERATION " + type.FullName + " " + Unwrap(ex));continue; }
+                          foreach(var method in methods) {
+                              try {
+                                  foreach(var parameter in method.GetParameters()) { var parameterType=parameter.ParameterType; }
+                                  var info=method as MethodInfo;
+                                  if(info!=null) { var returnType=info.ReturnType; }
+                                  good++;
+                              } catch(Exception ex) { bad++;Log("METHOD SIGNATURE " + type.FullName + "." + method.Name + " " + Unwrap(ex)); }
+                          }
+                      }
+                      Show(name + ": signatures inspected=" + good + "; errors=" + bad + " (no method execution)");
+                  }
+                  private static Exception Unwrap(Exception ex)
+                  {
+                      while (ex is TargetInvocationException && ex.InnerException != null) ex = ex.InnerException;
+                      return ex;
+                  }
+              }
+          }
+          ''')
+      - name: Write ManagedProbe.csproj (1/1)
+        shell: python
+        run: |
+          from pathlib import Path
+          path = Path("xbox-cmz-services") / 'ManagedProbe.csproj'
+          path.parent.mkdir(parents=True, exist_ok=True)
+          with path.open('w', encoding="utf-8", newline="") as output:
+              output.write(r'''<?xml version="1.0" encoding="utf-8"?>
+          <Project ToolsVersion="Current" DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+            <Import Project="$(MSBuildExtensionsPath)\$(MSBuildToolsVersion)\Microsoft.Common.props" Condition="Exists('$(MSBuildExtensionsPath)\$(MSBuildToolsVersion)\Microsoft.Common.props')" />
+            <PropertyGroup>
+              <Configuration Condition="'$(Configuration)'==''">Debug</Configuration>
+              <Platform Condition="'$(Platform)'==''">x64</Platform>
+              <ProjectGuid>{8EF2EC60-EF4A-46E4-92BC-C48271B1E847}</ProjectGuid>
+              <OutputType>AppContainerExe</OutputType>
+              <RootNamespace>NexiaCMZLoader</RootNamespace>
+              <AssemblyName>NexiaCMZLoader</AssemblyName>
+              <DefaultLanguage>en-US</DefaultLanguage>
+              <TargetPlatformIdentifier>UAP</TargetPlatformIdentifier>
+              <TargetPlatformVersion Condition="'$(TargetPlatformVersion)'==''">10.0.19041.0</TargetPlatformVersion>
+              <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
+              <MinimumVisualStudioVersion>17.0</MinimumVisualStudioVersion>
+              <ProjectTypeGuids>{A5A43C5B-DE2A-4C0C-9213-0A381AF9435A};{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}</ProjectTypeGuids>
+              <FileAlignment>512</FileAlignment>
+              <LangVersion>10.0</LangVersion>
+              <Nullable>disable</Nullable>
+              <EnableDotNetNativeCompatibleProfile>true</EnableDotNetNativeCompatibleProfile>
+              <UseDotNetNativeToolchain>false</UseDotNetNativeToolchain>
+              <AppxPackageSigningEnabled>false</AppxPackageSigningEnabled>
+              <AppxAutoIncrementPackageRevision>false</AppxAutoIncrementPackageRevision>
+              <GenerateAppInstallerFile>false</GenerateAppInstallerFile>
+              <AppxBundle>Never</AppxBundle>
+              <AppxSymbolPackageEnabled>false</AppxSymbolPackageEnabled>
+              <GenerateAppxPackageOnBuild>true</GenerateAppxPackageOnBuild>
+              <RestoreProjectStyle>PackageReference</RestoreProjectStyle>
+            </PropertyGroup>
+            <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+              <DebugSymbols>true</DebugSymbols>
+              <DebugType>full</DebugType>
+              <OutputPath>bin\x64\Debug\</OutputPath>
+              <DefineConstants>DEBUG;TRACE;NETFX_CORE;WINDOWS_UWP;WINDOWS_UAP</DefineConstants>
+              <PlatformTarget>x64</PlatformTarget>
+              <Prefer32Bit>false</Prefer32Bit>
+              <UseVSHostingProcess>false</UseVSHostingProcess>
+              <Optimize>false</Optimize>
+            </PropertyGroup>
+            <ItemGroup>
+              <ApplicationDefinition Include="App.xaml"><Generator>MSBuild:Compile</Generator><SubType>Designer</SubType></ApplicationDefinition>
+              <Compile Include="App.xaml.cs"><DependentUpon>App.xaml</DependentUpon></Compile>
+              <Compile Include="CmzLoader.cs" />
+              <Compile Include="StartupHooks.cs" />
+              <Compile Include="RuntimePatches.cs" />
+              <Compile Include="StartupFiles.cs" />
+              <Compile Include="XactCompatibility.cs" />
+              <Compile Include="XactSoundBank.cs" />
+              <Compile Include="ResidentMusic.cs" />
+              <Compile Include="ResidentMusicPolicy.cs" />
+              <Compile Include="ResidentMusicBank.cs" />
+              <Compile Include="LocalServices.cs" />
+              <Compile Include="LocalStorage.cs" />
+              <Compile Include="NexiaGuardedSignatures.cs" />
+
+              <AppxManifest Include="Package.appxmanifest"><SubType>Designer</SubType></AppxManifest>
+              <Content Include="Assets\*.png" />
+              <Content Include="NEXIA-LICENSE.txt" /><Content Include="MONOGAME-LICENSE.txt" />
+              <Content Include="THIRD-PARTY-NOTICES.txt" /><Content Include="SOURCE-PROVENANCE.json" />
+            </ItemGroup>
+            <ItemGroup>
+              <PackageReference Include="Microsoft.NETCore.UniversalWindowsPlatform" Version="6.2.14" />
+              <PackageReference Include="Mono.Cecil" Version="0.11.6" />
+              <PackageReference Include="MonoGame.Framework.WindowsUniversal" Version="3.8.1.303" />
+            </ItemGroup>
+            <Import Project="$(MSBuildExtensionsPath)\Microsoft\WindowsXaml\v$(VisualStudioVersion)\Microsoft.Windows.UI.Xaml.CSharp.targets" />
+          </Project>
+          ''')
+      - name: Write Package.appxmanifest (1/1)
+        shell: python
+        run: |
+          from pathlib import Path
+          path = Path("xbox-cmz-services") / 'Package.appxmanifest'
+          path.parent.mkdir(parents=True, exist_ok=True)
+          with path.open('w', encoding="utf-8", newline="") as output:
+              output.write(r'''<?xml version="1.0" encoding="utf-8"?>
+          <Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+                   xmlns:mp="http://schemas.microsoft.com/appx/2014/phone/manifest"
+                   xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10" IgnorableNamespaces="uap mp">
+            <Identity Name="NexiaCMZLoader" Publisher="CN=NexiaCMZLoader" Version="0.9.1.0" ProcessorArchitecture="x64" />
+            <mp:PhoneIdentity PhoneProductId="8ef2ec60-ef4a-46e4-92bc-c48271b1e847" PhonePublisherId="00000000-0000-0000-0000-000000000000" />
+            <Properties>
+              <DisplayName>CMZ Assembly Loader</DisplayName>
+              <PublisherDisplayName>Personal Xbox port experiment</PublisherDisplayName>
+              <Logo>Assets\StoreLogo.png</Logo>
+            </Properties>
+            <Dependencies><TargetDeviceFamily Name="Windows.Universal" MinVersion="10.0.17763.0" MaxVersionTested="10.0.19041.0" /></Dependencies>
+            <Resources><Resource Language="en-us" /></Resources>
+            <Applications>
+              <Application Id="App" Executable="$targetnametoken$.exe" EntryPoint="NexiaCMZLoader.App">
+                <uap:VisualElements DisplayName="CMZ Assembly Loader" Description="Managed runtime experiment. Not an emulator."
+                    BackgroundColor="#101820" Square150x150Logo="Assets\Square150.png" Square44x44Logo="Assets\Square44.png">
+                  <uap:SplashScreen Image="Assets\Splash.png" />
+                </uap:VisualElements>
+              </Application>
+            </Applications>
+          </Package>
+          ''')
+      - name: Write PackagingTool/Program.cs (1/1)
+        shell: python
+        run: |
+          from pathlib import Path
+          path = Path("xbox-cmz-services") / 'PackagingTool/Program.cs'
+          path.parent.mkdir(parents=True, exist_ok=True)
+          with path.open('w', encoding="utf-8", newline="") as output:
+              output.write(r'''// Patch only the app-local unsigned MonoGame copy, then validate it before packaging.
+          using Mono.Cecil;
+          using Mono.Cecil.Cil;
+          if(args.Length!=1) throw new ArgumentException("Expected unpacked package directory");
+          string directory=Path.GetFullPath(args[0]);
+          string target=Path.Combine(directory,"MonoGame.Framework.dll");
+          string managedPath=Path.Combine(directory,"entrypoint","NexiaCMZLoader.exe");
+          if(!File.Exists(managedPath)) throw new FileNotFoundException("Managed UWP payload is missing",managedPath);
+          using var app=AssemblyDefinition.ReadAssembly(managedPath);
+          if(app.Name.Name!="NexiaCMZLoader") throw new InvalidDataException("Unexpected app identity");
+          var bridge=app.MainModule.GetType("NexiaCMZLoader.StartupFiles")??throw new Exception("Host stream bridge missing");
+          var hostMethod=bridge.Methods.Single(m=>m.Name=="OpenTitleStream" && m.IsPublic && m.IsStatic && m.Parameters.Count==1);
+          var readerType=app.MainModule.GetType("NexiaCMZLoader.XactEndianReader")??throw new Exception("XACT reader missing");
+          if(!readerType.IsPublic || readerType.BaseType.FullName!="System.IO.BinaryReader") throw new Exception("Unexpected XACT reader base");
+          readerType.Methods.Single(m=>m.IsConstructor && m.IsPublic && !m.IsStatic && m.Parameters.Count==1 && m.Parameters[0].ParameterType.FullName=="System.IO.Stream");
+          var hooksType=app.MainModule.GetType("NexiaCMZLoader.StartupHooks")??throw new Exception("Startup hooks missing");
+          hooksType.Methods.Single(m=>m.Name=="Once" && m.IsPublic && m.IsStatic && m.Parameters.Count==1);
+          string[] audioTypes={"AudioEngine","SoundBank","WaveBank"};
+          using(var assembly=AssemblyDefinition.ReadAssembly(target)) {
+              var module=assembly.MainModule;
+              var reference=new AssemblyNameReference(app.Name.Name,app.Name.Version);
+              module.AssemblyReferences.Add(reference);
+              var type=module.GetType("Microsoft.Xna.Framework.TitleContainer")??throw new Exception("MonoGame TitleContainer missing");
+              var method=type.Methods.Single(m=>m.Name=="OpenStream" && m.IsPublic && m.IsStatic && m.Parameters.Count==1 && m.Parameters[0].ParameterType.FullName=="System.String");
+              if(method.ReturnType.FullName!="System.IO.Stream") throw new Exception("Unexpected stream signature");
+              var declaring=new TypeReference("NexiaCMZLoader","StartupFiles",module,reference);
+              var call=new MethodReference(hostMethod.Name,method.ReturnType,declaring){HasThis=false};
+              call.Parameters.Add(new ParameterDefinition(module.TypeSystem.String));
+              method.Body=new MethodBody(method);
+              var il=method.Body.GetILProcessor();il.Emit(OpCodes.Ldarg_0);il.Emit(OpCodes.Call,call);il.Emit(OpCodes.Ret);
+              var hook=new MethodReference("Once",module.TypeSystem.Void,new TypeReference("NexiaCMZLoader","StartupHooks",module,reference)){HasThis=false};
+              hook.Parameters.Add(new ParameterDefinition(module.TypeSystem.String));
+              foreach(string name in audioTypes) {
+                  var audio=module.GetType("Microsoft.Xna.Framework.Audio."+name)??throw new Exception("Missing XACT type "+name);
+                  int patches=0;
+                  foreach(var constructor in audio.Methods.Where(m=>m.IsConstructor && !m.IsStatic && m.HasBody)) {
+                      bool changed=false;
+                      foreach(var instruction in constructor.Body.Instructions) {
+                          if(instruction.OpCode!=OpCodes.Newobj || instruction.Operand is not MethodReference ctor ||
+                              ctor.DeclaringType.FullName!="System.IO.BinaryReader") continue;
+                          if(ctor.Parameters.Count!=1 || ctor.Parameters[0].ParameterType.FullName!="System.IO.Stream")
+                              throw new Exception("Unexpected BinaryReader constructor in "+name);
+                          var adapted=new MethodReference(".ctor",module.TypeSystem.Void,
+                              new TypeReference("NexiaCMZLoader","XactEndianReader",module,reference)){HasThis=true};
+                          adapted.Parameters.Add(new ParameterDefinition(ctor.Parameters[0].ParameterType));
+                          instruction.Operand=adapted;patches++;changed=true;
+                      }
+                      if(changed) {
+                          var editor=constructor.Body.GetILProcessor();
+                          foreach(var ret in constructor.Body.Instructions.Where(i=>i.OpCode==OpCodes.Ret).ToArray()) {
+                              // Existing branches still land on the original instruction, now the log message.
+                              ret.OpCode=OpCodes.Ldstr;ret.Operand="XACT "+name+" constructor returned (not playback verification).";
+                              var invoke=Instruction.Create(OpCodes.Call,hook);editor.InsertAfter(ret,invoke);
+                              editor.InsertAfter(invoke,Instruction.Create(OpCodes.Ret));
+                          }
+                      }
+                  }
+                  if(patches!=1) throw new Exception("Expected one reader construction in "+name+", found "+patches);
+                  Console.WriteLine("Patched "+name+": numeric reader now recognizes both Xbox and Windows bank byte order.");
+              }
+              var musicPolicy=app.MainModule.GetType("NexiaCMZLoader.ResidentMusicPolicy")??throw new Exception("Resident music policy missing");
+              var policy=musicPolicy.Methods.Single(m=>m.Name=="ValidateRequest" && m.IsStatic && m.IsPublic);
+              var guard=new MethodReference(policy.Name,module.TypeSystem.Void,
+                  new TypeReference("NexiaCMZLoader","ResidentMusicPolicy",module,reference)){HasThis=false};
+              guard.Parameters.Add(new ParameterDefinition(module.TypeSystem.String));
+              guard.Parameters.Add(new ParameterDefinition(module.TypeSystem.Int32));
+              guard.Parameters.Add(new ParameterDefinition(module.TypeSystem.Int16));
+              Startup09Patcher.Apply(module,guard);
+              assembly.Write(target+".patched");
+          }
+          using(var check=AssemblyDefinition.ReadAssembly(target+".patched")) {
+              Startup09Patcher.Verify(check.MainModule);
+              foreach(var name in audioTypes) {
+                  int count=check.MainModule.GetType("Microsoft.Xna.Framework.Audio."+name).Methods.Where(m=>m.HasBody)
+                      .SelectMany(m=>m.Body.Instructions).Count(i=>i.OpCode==OpCodes.Newobj &&
+                          i.Operand is MethodReference mr && mr.DeclaringType.FullName=="NexiaCMZLoader.XactEndianReader");
+                  if(count!=1) throw new Exception("Patched reader verification failed for "+name);
+              }
+          }
+          File.Move(target+".patched",target,true);
+          Console.WriteLine("Verified app-local content bridge and three XACT reader call sites; original audio/game files remain outside this package.");
+          ''')
+      - name: Write PackagingTool/Startup09Patcher.cs (1/1)
+        shell: python
+        run: |
+          from pathlib import Path
+          path = Path("xbox-cmz-services") / 'PackagingTool/Startup09Patcher.cs'
+          path.parent.mkdir(parents=True, exist_ok=True)
+          with path.open('w', encoding="utf-8", newline="") as output:
+              output.write(r'''// Original compatibility patch generator. Shared by packaging and synthetic execution tests.
+          using System;
+          using System.Linq;
+          using Mono.Cecil;
+          using Mono.Cecil.Cil;
+          public static class Startup09Patcher {
+              private const string G="Microsoft.Xna.Framework.Graphics.";
+              public static void Apply(ModuleDefinition module, MethodReference residentGuard) {
+                  var sprite=module.GetType(G+"SpriteBatch")??throw new InvalidOperationException("SpriteBatch is missing.");
+                  string[] signature={G+"SpriteSortMode",G+"BlendState",G+"SamplerState",G+"DepthStencilState",G+"RasterizerState",G+"Effect", "System.Nullable`1<Microsoft.Xna.Framework.Matrix>"};
+                  var begin=sprite.Methods.Single(m=>m.Name=="Begin" && m.IsPublic && !m.IsStatic &&
+                      m.ReturnType.FullName=="System.Void" && m.Parameters.Select(p=>p.ParameterType.FullName).SequenceEqual(signature));
+                  // These exact arities occur in the two original CMZ assemblies: 0, 2 and 5.
+                  foreach(int arity in new[]{0,2,5}) {
+                      if(sprite.Methods.Any(m=>m.Name=="Begin" && m.Parameters.Count==arity))
+                          throw new InvalidOperationException("Unexpected existing SpriteBatch.Begin overload: "+arity);
+                      var forward=new MethodDefinition("Begin",MethodAttributes.Public|MethodAttributes.HideBySig,module.TypeSystem.Void);
+                      foreach(var parameter in begin.Parameters.Take(arity))
+                          forward.Parameters.Add(new ParameterDefinition(parameter.Name,ParameterAttributes.None,parameter.ParameterType));
+                      sprite.Methods.Add(forward);
+                      forward.Body.InitLocals=true;
+                      var nullableMatrix=new VariableDefinition(begin.Parameters[6].ParameterType);forward.Body.Variables.Add(nullableMatrix);
+                      var il=forward.Body.GetILProcessor();
+                      il.Emit(OpCodes.Ldloca,nullableMatrix);il.Emit(OpCodes.Initobj,nullableMatrix.VariableType);
+                      il.Emit(OpCodes.Ldarg_0);
+                      for(int i=0;i<6;i++) {
+                          if(i<arity) il.Emit(OpCodes.Ldarg,forward.Parameters[i]);
+                          else if(i==0) il.Emit(OpCodes.Ldc_I4_0); // SpriteSortMode.Deferred
+                          else il.Emit(OpCodes.Ldnull);
+                      }
+                      il.Emit(OpCodes.Ldloc,nullableMatrix);il.Emit(OpCodes.Call,begin);il.Emit(OpCodes.Ret);
+                  }
+                  var wave=module.GetType("Microsoft.Xna.Framework.Audio.WaveBank")??throw new InvalidOperationException("WaveBank missing.");
+                  var nonstream=wave.Methods.Single(m=>m.IsConstructor && !m.IsStatic && m.IsPublic && m.Parameters.Count==2 &&
+                      m.Parameters[0].ParameterType.FullName=="Microsoft.Xna.Framework.Audio.AudioEngine" && m.Parameters[1].ParameterType.FullName=="System.String");
+                  var streaming=wave.Methods.Single(m=>m.IsConstructor && !m.IsStatic && m.IsPublic &&
+                      m.Parameters.Select(p=>p.ParameterType.FullName).SequenceEqual(new[]{"Microsoft.Xna.Framework.Audio.AudioEngine","System.String","System.Int32","System.Int16"}));
+                  if(residentGuard.ReturnType.FullName!="System.Void" || residentGuard.HasThis ||
+                      !residentGuard.Parameters.Select(p=>p.ParameterType.FullName).SequenceEqual(new[]{"System.String","System.Int32","System.Int16"}))
+                      throw new InvalidOperationException("Unexpected resident-bank guard signature.");
+                  streaming.Body=new MethodBody(streaming);
+                  var body=streaming.Body.GetILProcessor();
+                  body.Emit(OpCodes.Ldarg,streaming.Parameters[1]);body.Emit(OpCodes.Ldarg,streaming.Parameters[2]);body.Emit(OpCodes.Ldarg,streaming.Parameters[3]);
+                  body.Emit(OpCodes.Call,residentGuard);
+                  body.Emit(OpCodes.Ldarg_0);body.Emit(OpCodes.Ldarg_1);body.Emit(OpCodes.Ldarg_2);
+                  body.Emit(OpCodes.Call,nonstream);body.Emit(OpCodes.Ret);
+                  Console.WriteLine("0.9 adapters added: SpriteBatch.Begin(0/2/5) and guarded PCM-resident music constructor.");
+                  Verify(module);
+              }
+              public static void Verify(ModuleDefinition module) {
+                  var sprite=module.GetType(G+"SpriteBatch");
+                  foreach(int arity in new[]{0,2,5}) {
+                      var method=sprite.Methods.Single(m=>m.Name=="Begin" && m.Parameters.Count==arity);
+                      var calls=method.Body.Instructions.Where(i=>i.OpCode==OpCodes.Call).Select(i=>(MethodReference)i.Operand).ToArray();
+                      if(calls.Length!=1 || calls[0].Name!="Begin" || calls[0].DeclaringType.FullName!=G+"SpriteBatch" || calls[0].Parameters.Count!=7)
+                          throw new InvalidOperationException("SpriteBatch forwarding verification failed.");
+                  }
+                  var wave=module.GetType("Microsoft.Xna.Framework.Audio.WaveBank");
+                  var constructor=wave.Methods.Single(m=>m.IsConstructor && !m.IsStatic && m.Parameters.Count==4);
+                  var invoke=constructor.Body.Instructions.Where(i=>i.OpCode==OpCodes.Call).Select(i=>(MethodReference)i.Operand).ToArray();
+                  if(invoke.Length!=2 || invoke[0].Name!="ValidateRequest" || invoke[1].Name!=".ctor" ||
+                      invoke[1].DeclaringType.FullName!=wave.FullName || invoke[1].Parameters.Count!=2)
+                      throw new InvalidOperationException("PCM constructor redirect verification failed.");
+              }
+          }
+          ''')
+      - name: Write ResidentMusic.cs (1/1)
+        shell: python
+        run: |
+          from pathlib import Path
+          path = Path("xbox-cmz-services") / 'ResidentMusic.cs'
+          path.parent.mkdir(parents=True, exist_ok=True)
+          with path.open('w', encoding="utf-8", newline="") as output:
+              output.write(r'''// User-owned, predecoded bank input stays separate from the public app package.
+          // This is resident PCM playback through MonoGame, NOT an Xbox WMA streaming decoder.
+          using System;
+          using System.IO;
+          using System.IO.Compression;
+          using System.Security.Cryptography;
+          namespace NexiaCMZLoader {
+              public static class ResidentMusic {
+                  private const string ZipHash="d80382ae5bcc419e13c6c34deb0cf4e4f5b1efb32c170bdf0abc49de5c88bdf9";
+                  private const string BankHash="7ebaa8133cd553fc0feaf074e6433bbc7e1ce6d1966fcf9622675fe44e251139";
+                  private const long ZipLength=106705787, BankLength=117391772;
+                  private static string bankPath;
+                  private static string Hash(Stream input) {
+                      using(var h=SHA256.Create()) return BitConverter.ToString(h.ComputeHash(input)).Replace("-","").ToLowerInvariant();
+                  }
+                  private static bool VerifiedBank(string path) {
+                      if(!File.Exists(path) || new FileInfo(path).Length!=BankLength) return false;
+                      using(var input=File.OpenRead(path)) return Hash(input)==BankHash;
+                  }
+                  public static void Import(string localFolder) {
+                      bankPath=null;
+                      string directory=Path.Combine(localFolder,"ResidentMusic09");
+                      Directory.CreateDirectory(directory);
+                      string destination=Path.Combine(directory,"SoundsStreaming.pcm.xwb");
+                      if(!VerifiedBank(destination)) {
+                          string zip=Path.Combine(localFolder,"CastleMinerZ-music-pcm.zip");
+                          if(!File.Exists(zip)) throw new FileNotFoundException(
+                              "Upload CastleMinerZ-music-pcm.zip beside the two existing ZIPs in this app's LocalState; keep it zipped.",zip);
+                          if(new FileInfo(zip).Length!=ZipLength) throw new InvalidDataException("Wrong PCM music ZIP size.");
+                          using(var input=File.OpenRead(zip)) {
+                              if(Hash(input)!=ZipHash) throw new InvalidDataException("PCM music ZIP hash mismatch.");
+                              input.Position=0;
+                              using(var archive=new ZipArchive(input,ZipArchiveMode.Read)) {
+                                  if(archive.Entries.Count!=1 || archive.Entries[0].FullName!="SoundsStreaming.pcm.xwb" ||
+                                      archive.Entries[0].Length!=BankLength) throw new InvalidDataException("Unexpected PCM music ZIP inventory.");
+                                  string temp=destination+".incoming";
+                                  try {
+                                      using(var source=archive.Entries[0].Open())
+                                      using(var output=File.Create(temp)) {
+                                          byte[] buffer=new byte[65536];long total=0;int n;
+                                          while((n=source.Read(buffer,0,buffer.Length))>0) {
+                                              total+=n;if(total>BankLength) throw new InvalidDataException("PCM music bank too large.");
+                                              output.Write(buffer,0,n);
+                                          }
+                                          if(total!=BankLength) throw new EndOfStreamException("Incomplete PCM music bank.");
+                                      }
+                                      if(!VerifiedBank(temp)) throw new InvalidDataException("Extracted PCM music bank hash mismatch.");
+                                      using(var test=File.OpenRead(temp)) ResidentMusicBank.Validate(test,11,"SoundsStreaming");
+                                      if(File.Exists(destination)) File.Delete(destination);
+                                      File.Move(temp,destination);
+                                  } finally { if(File.Exists(temp)) File.Delete(temp); }
+                              }
+                          }
+                      }
+                      using(var input=File.OpenRead(destination)) ResidentMusicBank.Validate(input,11,"SoundsStreaming");
+                      bankPath=destination;
+                      StartupHooks.Note("MUSIC INPUT: verified 11 decoded PCM tracks; about 112 MiB resident audio. Native compressed streaming is not used.");
+                  }
+                  public static Stream OpenBank() {
+                      if(bankPath==null) throw new InvalidOperationException("Verified PCM music bank has not been imported.");
+                      StartupHooks.Once("MUSIC ROUTE: original SoundsStreaming cue indices use decoded resident PCM bank. Playback must be confirmed by listening.");
+                      return File.OpenRead(bankPath);
+                  }
+              }
+          }
+          ''')
+      - name: Write ResidentMusicBank.cs (1/1)
+        shell: python
+        run: |
+          from pathlib import Path
+          path = Path("xbox-cmz-services") / 'ResidentMusicBank.cs'
+          path.parent.mkdir(parents=True, exist_ok=True)
+          with path.open('w', encoding="utf-8", newline="") as output:
+              output.write(r'''// Strict reader for the new little-endian, uncompressed music bank. No audio playback occurs here.
+          using System;
+          using System.IO;
+          using System.Text;
+          namespace NexiaCMZLoader {
+              public static class ResidentMusicBank {
+                  public static long Validate(Stream input, int expectedTracks, string expectedName) {
+                      if(input==null || !input.CanRead || !input.CanSeek) throw new ArgumentException("Readable seekable bank required.");
+                      if(input.Length<148 || input.Length>160L*1024*1024) throw new InvalidDataException("Invalid music bank size.");
+                      input.Position=0;
+                      using(var r=new BinaryReader(input,Encoding.UTF8,true)) {
+                          if(r.ReadUInt32()!=0x444E4257 || r.ReadUInt32()!=46 || r.ReadUInt32()!=44)
+                              throw new InvalidDataException("Expected little-endian PCM music bank v46/header44.");
+                          long[] offsets=new long[5], lengths=new long[5];
+                          for(int i=0;i<5;i++) {
+                              offsets[i]=r.ReadUInt32();lengths[i]=r.ReadUInt32();
+                              if(offsets[i]+lengths[i]>input.Length) throw new InvalidDataException("Bank segment outside file.");
+                          }
+                          if(offsets[0]!=52 || lengths[0]!=96 || offsets[1]!=148 ||
+                              lengths[1]!=24L*expectedTracks || offsets[2]!=0 || lengths[2]!=0 ||
+                              offsets[3]!=0 || lengths[3]!=0 || offsets[4]!=148+24L*expectedTracks ||
+                              offsets[4]+lengths[4]!=input.Length)
+                              throw new InvalidDataException("Unexpected PCM bank layout.");
+                          input.Position=52;
+                          if(r.ReadUInt32()!=0 || r.ReadUInt32()!=expectedTracks) throw new InvalidDataException("Unexpected flags or track count.");
+                          byte[] name=r.ReadBytes(64);
+                          if(name.Length!=64 || Encoding.UTF8.GetString(name,0,64).TrimEnd('\0')!=expectedName)
+                              throw new InvalidDataException("Music bank name mismatch.");
+                          if(r.ReadUInt32()!=24 || r.ReadUInt32()!=0 || r.ReadUInt32()!=4 || r.ReadUInt32()!=0)
+                              throw new InvalidDataException("Unexpected entry metadata or alignment.");
+                          r.ReadUInt64();
+                          long lastEnd=0,pcmBytes=0;
+                          for(int i=0;i<expectedTracks;i++) {
+                              input.Position=148+24L*i;
+                              uint duration=r.ReadUInt32(),fmt=r.ReadUInt32(),offset=r.ReadUInt32(),size=r.ReadUInt32();
+                              uint loopStart=r.ReadUInt32(),loopLength=r.ReadUInt32();
+                              int channels=(int)((fmt>>2)&7),rate=(int)((fmt>>5)&0x3ffff),alignment=(int)((fmt>>23)&255);
+                              long samples=duration>>4;
+                              if((fmt&3)!=0 || fmt>>31!=1 || (channels!=1 && channels!=2) || rate!=44100 ||
+                                  alignment!=2*channels || samples<=0 || size!=samples*channels*2 || (duration&15)!=0 ||
+                                  offset%4!=0 || offset<lastEnd || offset+(long)size>lengths[4] || loopStart!=0 || loopLength!=0)
+                                  throw new InvalidDataException("Invalid PCM track " + i);
+                              lastEnd=offset+(long)size;pcmBytes+=size;
+                          }
+                          if(lastEnd!=lengths[4]) throw new InvalidDataException("Trailing or incomplete PCM bank data.");
+                          return pcmBytes;
+                      }
+                  }
+              }
+          }
+          ''')
+      - name: Write ResidentMusicPolicy.cs (1/1)
+        shell: python
+        run: |
+          from pathlib import Path
+          path = Path("xbox-cmz-services") / 'ResidentMusicPolicy.cs'
+          path.parent.mkdir(parents=True, exist_ok=True)
+          with path.open('w', encoding="utf-8", newline="") as output:
+              output.write(r'''// Only the known game music bank is redirected; unsupported requests still fail explicitly.
+          using System;
+          namespace NexiaCMZLoader {
+              public static class ResidentMusicPolicy {
+                  public static bool IsMusicPath(string path) {
+                      return path != null && string.Equals(path.Replace('\\','/'),
+                          "Content/SoundsStreaming.xwb", StringComparison.OrdinalIgnoreCase);
+                  }
+                  public static void ValidateRequest(string path, int offset, short packetSize) {
+                      if(!IsMusicPath(path)) throw new NotSupportedException("Resident music adapter only supports Content/SoundsStreaming.xwb.");
+                      if(offset!=0) throw new ArgumentOutOfRangeException("offset", "Only the verified zero-offset bank is supported.");
+                      if(packetSize<2) throw new ArgumentOutOfRangeException("packetSize");
+                  }
+              }
+          }
+          ''')
+      - name: Write SOURCE-PROVENANCE.json (1/1)
+        shell: python
+        run: |
+          from pathlib import Path
+          path = Path("xbox-cmz-services") / 'SOURCE-PROVENANCE.json'
+          path.parent.mkdir(parents=True, exist_ok=True)
+          with path.open('w', encoding="utf-8", newline="") as output:
+              output.write(r'''{
+            "repository": "tjkeelan13-ctrl/Nexia360-emulation-edition",
+            "reference_commit": "a7dbc4fef5738fddfbaf84e9401d5ad780b84460",
+            "license": "BSD-3-Clause (NEXIA-LICENSE.txt)",
+            "inputs": [
+              {
+                "source": "GamerServices/Stubs.cs",
+                "git_blob_sha1": "b45da2b4dc5cd54ef8ca4dae034778d4a8c6dfe9",
+                "sha256": "223ff097fd9fd4deb1c64a4e768bedbd9a8d12e51fe1944910c0e5cc9ac99265"
+              },
+              {
+                "source": "Net/Stubs.cs",
+                "git_blob_sha1": "dfb73948f9805244a0d53ed17538900adeff46e3",
+                "sha256": "66337cb01e40b34e770756f579dd532eb6f0e29f2d9b64f94fe32e1c801f3121"
+              },
+              {
+                "source": "Avatar/Stubs.cs",
+                "git_blob_sha1": "64607d2cfc720d694a9e5171a00ac69d36939ce8",
+                "sha256": "179efa40ab1699b6530afe8ef2b16de29f94538377bfc7fb15b44045a2ba95d2"
+              },
+              {
+                "source": "Storage/Stubs.cs",
+                "git_blob_sha1": "a3508212601e4a4f3c196f0850f7c842abe3fcfa",
+                "sha256": "343540b50b2ae58b1c41424b7f363d8be5e3ee66bdd53e6cf7efb21fb1007e07"
+              },
+              {
+                "source": "Storage/Extra.cs",
+                "git_blob_sha1": "7b877721a75c78501192b087897e784e9df9d619",
+                "sha256": "eb7eef3a538c124e1fd8e1a4a4219a8fd4652044646dc8b9d79fdf1a5676de0c"
+              }
+            ],
+            "changes": {
+              "NexiaGuardedSignatures.cs": "Removed replaced offline definitions and converted unimplemented executable members to explicit NotSupportedException; retained enum/type declarations.",
+              "LocalStorage.cs": "Adapted Nexia Storage Stubs/Extra to app-local per-slot storage. Fixed directory boundary/rooted-path rejection and disposal checks. Capacity values are not implemented.",
+              "LocalServices.cs": "Original experimental offline services and synthetic-slot tests, matched against XNA declarations. No game is started."
+            },
+            "startup07": {
+              "base_commit": "eda2d016da2243232257a109fee294d3cc01f62f",
+              "changes": "See README.txt",
+              "original_game_files_in_public_workflow": false,
+              "xbox07_run": false
+            },
+            "startup08": {
+              "baseline": "0.7.2 on user Xbox: constructor, LoadContent(Debug), Initialize returned; SecondaryLoad failed at Sounds.xgs; Update at Guide.IsTrialMode",
+              "input_content_zip_unchanged": true,
+              "shared_system_runtimes_modified": false,
+              "changes": [
+                "XactEndianReader overrides BinaryReader numeric operations for Xbox and Windows bank signatures",
+                "XactWaveBank validates v46/header44 and converts PCM16 samples in an in-memory copy, compressed samples unchanged",
+                "App-local MonoGame AudioEngine/SoundBank/WaveBank reader constructors retargeted at packaging",
+                "Guide.IsTrialMode explicitly true for a trial-only development host; no full license assertion",
+                "Build-time tests use identical XactCompatibility source with synthetic data; not a playback test",
+                "XSB packed half-word layout adapted for cue name length and variation tables, with basic-event-only validation"
+              ],
+              "upstream_sources": {
+                "MonoGame/AudioEngine.cs": "https://github.com/MonoGame/MonoGame/blob/v3.8.1/MonoGame.Framework/Audio/Xact/AudioEngine.cs",
+                "MonoGame/SoundBank.cs": "https://github.com/MonoGame/MonoGame/blob/v3.8.1/MonoGame.Framework/Audio/Xact/SoundBank.cs",
+                "MonoGame/WaveBank.cs": "https://github.com/MonoGame/MonoGame/blob/v3.8.1/MonoGame.Framework/Audio/Xact/WaveBank.cs",
+                "MonoGame/streaming-limit": "https://github.com/MonoGame/MonoGame/blob/v3.8.1/MonoGame.Framework/Platform/Audio/Xact/WaveBank.Default.cs",
+                "FAudio/PCM-endian-reference": "https://github.com/FNA-XNA/FAudio/blob/6839b88e304a046ae1a609ff14a085371e02a4e0/src/FACT_internal.c"
+              },
+              "new_csharp_code_and_xbox_test": "not yet compiled or run at preparation"
+            },
+            "startup09": {
+              "base_commit": "52aec9318b2deb8d7e123edd5419748d868cffce",
+              "baseline_log": "0.8.3: SpriteBatch.Begin(5) missing, streamed music unsupported; 127 PCM tracks decoded/created without reported construction failure",
+              "new_code": [
+                "ResidentMusic.cs",
+                "ResidentMusicPolicy.cs",
+                "ResidentMusicBank.cs",
+                "PackagingTool/Startup09Patcher.cs",
+                "Startup09Tests"
+              ],
+              "game_assets_in_public_workflow": false,
+              "method": "Specific original SpriteBatch overloads forwarded with defaults; known music constructor uses resident predecoded PCM instead of native streaming",
+              "native_wma_streaming_implemented": false,
+              "xbox09_tested": false
+            }
+          }
+          ''')
+      - name: Write Startup09Tests/Program.cs (1/1)
+        shell: python
+        run: |
+          from pathlib import Path
+          path = Path("xbox-cmz-services") / 'Startup09Tests/Program.cs'
+          path.parent.mkdir(parents=True, exist_ok=True)
+          with path.open('w', encoding="utf-8", newline="") as output:
+              output.write(r'''// Executes the exact IL patch against a synthetic fixture, never game files or GPU/audio drivers.
+          using System;
+          using System.IO;
+          using System.Linq;
+          using System.Reflection;
+          using System.Runtime.Loader;
+          using System.Text;
+          using Mono.Cecil;
+          using NexiaCMZLoader;
+          namespace Startup09Tests {
+              internal static class Program {
+                  private static void Require(bool result,string message) { if(!result) throw new Exception(message); }
+                  public static void Main() {
+                      byte[] bytes;
+                      using(var assembly=AssemblyDefinition.ReadAssembly(Assembly.GetExecutingAssembly().Location)) {
+                          assembly.Name.Name="CmzPatchFixture_"+Guid.NewGuid().ToString("N");
+                          var module=assembly.MainModule;
+                          var guard=module.GetType("NexiaCMZLoader.ResidentMusicPolicy").Methods.Single(m=>m.Name=="ValidateRequest");
+                          Startup09Patcher.Apply(module,guard);
+                          using(var output=new MemoryStream()) { assembly.Write(output);bytes=output.ToArray(); }
+                      }
+                      using(var input=new MemoryStream(bytes))
+                      using(var verification=AssemblyDefinition.ReadAssembly(input)) Startup09Patcher.Verify(verification.MainModule);
+                      Assembly fixture;
+                      using(var input=new MemoryStream(bytes)) fixture=AssemblyLoadContext.Default.LoadFromStream(input);
+                      var spriteType=fixture.GetType("Microsoft.Xna.Framework.Graphics.SpriteBatch",true);
+                      var sortType=fixture.GetType("Microsoft.Xna.Framework.Graphics.SpriteSortMode",true);
+                      foreach(int count in new[]{0,2,5}) {
+                          var instance=Activator.CreateInstance(spriteType);
+                          var begin=spriteType.GetMethods().Single(m=>m.Name=="Begin" && m.GetParameters().Length==count);
+                          var args=begin.GetParameters().Select((p,i)=>i==0?Enum.ToObject(sortType,1):Activator.CreateInstance(p.ParameterType)).ToArray();
+                          begin.Invoke(instance,args);
+                          var last=(object[])spriteType.GetField("Last").GetValue(instance);
+                          Require(last!=null && last.Length==7,"Forwarded Begin not invoked");
+                          for(int i=0;i<count;i++) Require(i==0?last[i].Equals(args[i]):ReferenceEquals(last[i],args[i]),"Dropped or changed Begin parameter");
+                          if(count==0) Require(Convert.ToInt32(last[0])==0,"Default sort mode is not Deferred");
+                          for(int i=Math.Max(1,count);i<7;i++) Require(last[i]==null,"Missing Begin arguments not forwarded as null");
+                          Console.WriteLine("PASS executed SpriteBatch.Begin("+count+") forwarding: exact arguments and defaults.");
+                      }
+                      var waveType=fixture.GetType("Microsoft.Xna.Framework.Audio.WaveBank",true);
+                      var engineType=fixture.GetType("Microsoft.Xna.Framework.Audio.AudioEngine",true);
+                      var engine=Activator.CreateInstance(engineType);
+                      object wave=Activator.CreateInstance(waveType,new object[]{engine,"Content\\SoundsStreaming.xwb",0,(short)2});
+                      Require(!(bool)waveType.GetField("Streaming").GetValue(wave),"Streaming path was not converted to resident path");
+                      Require(ReferenceEquals(waveType.GetField("Engine").GetValue(wave),engine),"Audio engine not preserved");
+                      Require((string)waveType.GetField("Name").GetValue(wave)=="Content\\SoundsStreaming.xwb","Bank name not preserved");
+                      Console.WriteLine("PASS executed resident-bank constructor redirect, preserving engine and bank filename.");
+                      foreach(var args in new[]{new object[]{engine,"Content/Other.xwb",0,(short)2},new object[]{engine,"Content/SoundsStreaming.xwb",1,(short)2},new object[]{engine,"Content/SoundsStreaming.xwb",0,(short)1}}) {
+                          bool rejected=false;
+                          try { Activator.CreateInstance(waveType,args); }
+                          catch(TargetInvocationException ex) { rejected=ex.InnerException is NotSupportedException || ex.InnerException is ArgumentOutOfRangeException; }
+                          Require(rejected,"Invalid bank request accepted");
+                      }
+                      Console.WriteLine("PASS unsupported bank/offset/packet requests remain rejected.");
+                      byte[] bank=TinyBank();
+                      using(var input=new MemoryStream(bank)) Require(ResidentMusicBank.Validate(input,1,"SoundsStreaming")==8,"Synthetic PCM bank rejected");
+                      foreach(int field in new[]{0,52,148+4,148+8,148+12}) {
+                          var bad=(byte[])bank.Clone();bad[field]^=1;
+                          bool rejected=false;try { using(var input=new MemoryStream(bad)) ResidentMusicBank.Validate(input,1,"SoundsStreaming"); }
+                          catch(InvalidDataException) { rejected=true; }
+                          Require(rejected,"Corrupt PCM metadata accepted at "+field);
+                      }
+                      using(var input=new MemoryStream(bank.Take(bank.Length-1).ToArray())) {
+                          bool rejected=false;try{ResidentMusicBank.Validate(input,1,"SoundsStreaming");}catch(InvalidDataException){rejected=true;}
+                          Require(rejected,"Truncated bank accepted");
+                      }
+                      Console.WriteLine("PASS PCM bank validator: valid synthetic bank, corrupt headers/formats/ranges and truncated data.");
+                      Console.WriteLine("ALL 0.9 SYNTHETIC TESTS PASSED. NOT A GPU DRAW, AUDIBLE PLAYBACK OR GAMEPLAY TEST.");
+                  }
+                  private static byte[] TinyBank() {
+                      using(var output=new MemoryStream()) {
+                          using(var w=new BinaryWriter(output,Encoding.UTF8,true)) {
+                              w.Write(0x444E4257u);w.Write(46u);w.Write(44u);
+                              foreach(var pair in new[]{new[]{52u,96u},new[]{148u,24u},new[]{0u,0u},new[]{0u,0u},new[]{172u,8u}}) { w.Write(pair[0]);w.Write(pair[1]); }
+                              w.Write(0u);w.Write(1u);byte[] name=new byte[64];Encoding.UTF8.GetBytes("SoundsStreaming").CopyTo(name,0);w.Write(name);
+                              w.Write(24u);w.Write(0u);w.Write(4u);w.Write(0u);w.Write(0ul);
+                              w.Write(4u<<4);w.Write((1u<<31)|(2u<<23)|(44100u<<5)|(1u<<2));w.Write(0u);w.Write(8u);w.Write(0u);w.Write(0u);
+                              w.Write(new byte[]{0,1,0,2,0,3,0,4});
+                          }
+                          return output.ToArray();
+                      }
+                  }
+              }
+          }
+          // Minimal fixtures contain no MonoGame implementation; they only record actual argument forwarding.
+          namespace Microsoft.Xna.Framework { public struct Matrix { public float M11; } }
+          namespace Microsoft.Xna.Framework.Graphics {
+              public enum SpriteSortMode { Deferred=0,Immediate=1 }
+              public class BlendState { } public class SamplerState { } public class DepthStencilState { }
+              public class RasterizerState { } public class Effect { }
+              public class SpriteBatch {
+                  public object[] Last;
+                  public void Begin(SpriteSortMode sort,BlendState blend,SamplerState sampler,DepthStencilState depth,RasterizerState raster,Effect effect,Microsoft.Xna.Framework.Matrix? matrix) {
+                      Last=new object[]{sort,blend,sampler,depth,raster,effect,matrix};
+                  }
+              }
+          }
+          namespace Microsoft.Xna.Framework.Audio {
+              public class AudioEngine { }
+              public class WaveBank {
+                  public readonly AudioEngine Engine; public readonly string Name; public readonly bool Streaming;
+                  public WaveBank(AudioEngine engine,string name) { Engine=engine;Name=name;Streaming=false; }
+                  public WaveBank(AudioEngine engine,string name,int offset,short packets) { Engine=engine;Name=name;Streaming=true; }
+              }
+          }
+          ''')
+      - name: Write Startup09Tests/Startup09Tests.csproj (1/1)
+        shell: python
+        run: |
+          from pathlib import Path
+          path = Path("xbox-cmz-services") / 'Startup09Tests/Startup09Tests.csproj'
+          path.parent.mkdir(parents=True, exist_ok=True)
+          with path.open('w', encoding="utf-8", newline="") as output:
+              output.write(r'''<Project Sdk="Microsoft.NET.Sdk">
+            <PropertyGroup><TargetFramework>net8.0</TargetFramework><OutputType>Exe</OutputType><ImplicitUsings>disable</ImplicitUsings><Nullable>disable</Nullable><EnableDefaultCompileItems>false</EnableDefaultCompileItems></PropertyGroup>
+            <ItemGroup>
+              <PackageReference Include="Mono.Cecil" Version="0.11.6" />
+              <Compile Include="Program.cs" />
+              <Compile Include="../PackagingTool/Startup09Patcher.cs" Link="Startup09Patcher.cs" />
+              <Compile Include="../ResidentMusicPolicy.cs" Link="ResidentMusicPolicy.cs" />
+              <Compile Include="../ResidentMusicBank.cs" Link="ResidentMusicBank.cs" />
+            </ItemGroup>
+          </Project>
+          ''')
+      - name: Write StartupFiles.cs (1/1)
+        shell: python
+        run: |
+          from pathlib import Path
+          path = Path("xbox-cmz-services") / 'StartupFiles.cs'
+          path.parent.mkdir(parents=True, exist_ok=True)
+          with path.open('w', encoding="utf-8", newline="") as output:
+              output.write(r'''// Only this app's private, verified content archive is imported. No game download or online service.
+          using System;
+          using System.Collections.Generic;
+          using System.IO;
+          using System.IO.Compression;
+          using System.Linq;
+          using System.Reflection;
+          using System.Security.Cryptography;
+          using Microsoft.Xna.Framework.Content;
+          using Windows.ApplicationModel;
+          using Windows.Storage;
+
+          namespace NexiaCMZLoader {
+              public static class StartupFiles {
+                  public static string ContentFolder { get; private set; }
+                  internal static Assembly EngineAssembly, GameAssembly;
+                  public static void ImportContent(string localFolder) {
+                      const string expected="1888e88cc80cad625d2ae0416ea200c91919107b0b151e2d094f6380fd442132";
+                      string zip=Path.Combine(localFolder,"CastleMinerZ-startup-content.zip");
+                      if(!File.Exists(zip)) throw new FileNotFoundException("Upload CastleMinerZ-startup-content.zip to this app's LocalState, keeping it zipped.",zip);
+                      if(new FileInfo(zip).Length!=29032679) throw new InvalidDataException("Wrong startup content archive size.");
+                      string actual;
+                      using(var input=File.OpenRead(zip)) using(var sha=SHA256.Create())
+                          actual=BitConverter.ToString(sha.ComputeHash(input)).Replace("-","").ToLowerInvariant();
+                      if(actual!=expected) throw new InvalidDataException("Startup content archive hash mismatch.");
+                      ContentFolder=Path.Combine(localFolder,"StartupContent07");Directory.CreateDirectory(ContentFolder);
+                      using(var input=File.OpenRead(zip)) using(var archive=new ZipArchive(input,ZipArchiveMode.Read)) {
+                          if(archive.Entries.Count!=228) throw new InvalidDataException("Unexpected content inventory.");
+                          var seen=new HashSet<string>(StringComparer.OrdinalIgnoreCase);long total=0;
+                          foreach(var entry in archive.Entries) {
+                              var name=CleanRelative(entry.FullName);
+                              if(!seen.Add(name)) throw new InvalidDataException("Duplicate content entry");
+                              total+=entry.Length;
+                              if(entry.Length<0 || entry.Length>64*1024*1024 || total>192*1024*1024) throw new InvalidDataException("Content size limit exceeded.");
+                              var destination=Below(ContentFolder,name);Directory.CreateDirectory(Path.GetDirectoryName(destination));
+                              using(var source=entry.Open()) using(var output=File.Create(destination)) {
+                                  var buffer=new byte[65536];long written=0;int n;
+                                  while((n=source.Read(buffer,0,buffer.Length))>0) {
+                                      written+=n;if(written>entry.Length) throw new InvalidDataException("Oversized content entry");
+                                      output.Write(buffer,0,n);
+                                  }
+                                  if(written!=entry.Length) throw new EndOfStreamException("Incomplete content entry");
+                              }
+                          }
+                      }
+                      StartupHooks.Note("Verified/imported original content pack. 98 texture/font assets converted; other formats remain original.");
+                  }
+                  internal static string CleanRelative(string path) {
+                      if(string.IsNullOrWhiteSpace(path)) throw new ArgumentException("Empty content path");
+                      path=path.Replace('\\','/');
+                      if(path.StartsWith("/") || path.Contains(":")) throw new ArgumentException("Content path must be relative");
+                      var parts=path.Split('/');
+                      if(parts.Any(p=>p.Length==0 || p=="." || p==".." || p.IndexOfAny(Path.GetInvalidFileNameChars())>=0))
+                          throw new ArgumentException("Unsafe content path");
+                      return string.Join(Path.DirectorySeparatorChar.ToString(),parts);
+                  }
+                  internal static string Below(string root,string path) {
+                      var prefix=Path.GetFullPath(root).TrimEnd(Path.DirectorySeparatorChar)+Path.DirectorySeparatorChar;
+                      var full=Path.GetFullPath(Path.Combine(prefix,CleanRelative(path)));
+                      if(!full.StartsWith(prefix,StringComparison.OrdinalIgnoreCase)) throw new ArgumentException("Path outside content root");
+                      return full;
+                  }
+                  // The private copy of MonoGame in this app routes TitleContainer.OpenStream here.
+                  // AudioEngine and ContentManager can therefore read this app's LocalState assets.
+                  public static Stream OpenTitleStream(string path) {
+                      path=CleanRelative(path);
+                      if(ResidentMusicPolicy.IsMusicPath(path)) return ResidentMusic.OpenBank();
+                      var contentPrefix="Content"+Path.DirectorySeparatorChar;
+                      if(path.StartsWith(contentPrefix,StringComparison.OrdinalIgnoreCase)) {
+                          if(ContentFolder==null) throw new InvalidOperationException("Startup content not imported");
+                          var full=Below(ContentFolder,path.Substring(contentPrefix.Length));
+                          StartupHooks.Once("OPEN original title asset: "+path);
+                          // Normalize only PCM samples; compressed bank payloads remain unchanged.
+                          if(Path.GetExtension(full).Equals(".xsb",StringComparison.OrdinalIgnoreCase)) return XactSoundBank.Open(full);
+                          if(Path.GetExtension(full).Equals(".xwb",StringComparison.OrdinalIgnoreCase)) return XactWaveBank.Open(full);
+                          return File.OpenRead(full);
+                      }
+                      return File.OpenRead(Below(Package.Current.InstalledLocation.Path,path));
+                  }
+                  internal static string ContentPath(string name) {
+                      if(ContentFolder==null) throw new InvalidOperationException("Startup content unavailable");
+                      return Below(ContentFolder,name+".xnb");
+                  }
+              }
+              public sealed class StartupContentManager : ContentManager {
+                  private static readonly object ReaderGate=new object();
+                  private static readonly HashSet<string> Registered=new HashSet<string>();
+                  public StartupContentManager(IServiceProvider services) : base(services,"Content") { }
+                  public override T Load<T>(string name) {
+                      StartupHooks.Once("LOAD original content: "+name+" as "+typeof(T).FullName);
+                      return base.Load<T>(name);
+                  }
+                  protected override Stream OpenStream(string assetName) {
+                      var stream=File.OpenRead(StartupFiles.ContentPath(assetName));
+                      try {
+                          // Unconverted Xbox shaders/models/other content is not silently treated as PC data.
+                          using(var reader=new BinaryReader(stream,System.Text.Encoding.UTF8,true)) {
+                              if(new string(reader.ReadChars(3))!="XNB") throw new InvalidDataException("Invalid XNB asset");
+                              char platform=(char)reader.ReadByte();
+                              int version=reader.ReadByte(),flags=reader.ReadByte();
+                              int length=reader.ReadInt32();
+                              if(platform!='w') throw new NotSupportedException("This original asset still needs format conversion: "+assetName);
+                              if(version!=5 || (flags&0xC0)!=0 || length!=stream.Length) throw new InvalidDataException("Unexpected prepared XNB format");
+                              int count=Read7(reader);
+                              if(count<1 || count>128) throw new InvalidDataException("Invalid content reader count");
+                              for(int i=0;i<count;i++) {
+                                  string typeName=reader.ReadString();reader.ReadInt32();
+                                  RegisterReader(typeName);
+                              }
+                          }
+                          stream.Position=0;return stream;
+                      } catch { stream.Dispose();throw; }
+                  }
+                  private static int Read7(BinaryReader reader) {
+                      int n=0;
+                      for(int shift=0;shift<35;shift+=7) { byte b=reader.ReadByte();n|=(b&127)<<shift;if((b&128)==0)return n; }
+                      throw new InvalidDataException("Invalid encoded length");
+                  }
+                  private static Assembly ResolveReaderAssembly(AssemblyName name) {
+                      if(name.Name.StartsWith("Microsoft.Xna.Framework",StringComparison.Ordinal)) return typeof(ContentManager).Assembly;
+                      if(name.Name=="mscorlib" || name.Name=="System.Private.CoreLib") return typeof(object).Assembly;
+                      if(name.Name=="DNA.Common") return StartupFiles.EngineAssembly;
+                      if(name.Name=="CastleMinerZ") return StartupFiles.GameAssembly;
+                      return Assembly.Load(new AssemblyName(name.Name));
+                  }
+                  private static Type ResolveReaderType(Assembly assembly,string name,bool ignoreCase) {
+                      if(assembly!=null) return assembly.GetType(name,false,ignoreCase);
+                      foreach(var provider in new[]{typeof(ContentManager).Assembly,typeof(object).Assembly,StartupFiles.EngineAssembly,StartupFiles.GameAssembly}) {
+                          if(provider==null) continue;
+                          var type=provider.GetType(name,false,ignoreCase);if(type!=null)return type;
+                      }
+                      return null;
+                  }
+                  private static void RegisterReader(string name) {
+                      lock(ReaderGate) {
+                          if(Registered.Contains(name))return;
+                          var type=Type.GetType(name,ResolveReaderAssembly,ResolveReaderType,true);
+                          if(!typeof(ContentTypeReader).IsAssignableFrom(type)) throw new InvalidDataException("Invalid content reader type: "+name);
+                          ContentTypeReaderManager.AddTypeCreator(name,()=> (ContentTypeReader)Activator.CreateInstance(type));
+                          Registered.Add(name);
+                      }
+                  }
+              }
+          }
+          ''')
+      - name: Write StartupHooks.cs (1/1)
+        shell: python
+        run: |
+          from pathlib import Path
+          path = Path("xbox-cmz-services") / 'StartupHooks.cs'
+          path.parent.mkdir(parents=True, exist_ok=True)
+          with path.open('w', encoding="utf-8", newline="") as output:
+              output.write(r'''// Original CMZ port development code. This is instrumentation, not a replacement game.
+          using System;
+          using System.Collections.Generic;
+          using System.IO;
+          using System.Reflection;
+          using System.Threading;
+          using Microsoft.Xna.Framework;
+          using Microsoft.Xna.Framework.Graphics;
+
+          namespace NexiaCMZLoader {
+              public static class StartupHooks {
+                  private static readonly object Gate = new object();
+                  private static readonly List<string> Lines = new List<string>();
+                  private static readonly HashSet<string> Seen = new HashSet<string>();
+                  private static string logPath;
+                  private static int failed;
+                  private static long updates, draws;
+                  public static bool Failed { get { return Interlocked.CompareExchange(ref failed,0,0) != 0; } }
+                  public static void Begin(string folder) {
+                      logPath=Path.Combine(folder,"cmz-startup-log.txt");
+                      File.WriteAllText(logPath,"CMZ ORIGINAL STARTUP ATTEMPT 0.9 " + DateTime.UtcNow.ToString("O") + "\r\n");
+                      Note("Original startup 0.9: SpriteBatch overload compatibility + verified resident PCM music bank.");
+                      Note("Music uses an offline-decoded bank, not a native streaming decoder. Avatars and split-screen remain unimplemented; trial-only policy is unchanged.");
+                  }
+                  public static void Note(string text) {
+                      lock(Gate) {
+                          Lines.Add(text);
+                          try { File.AppendAllText(logPath,DateTime.UtcNow.ToString("O")+" "+text+"\r\n"); } catch { }
+                      }
+                  }
+                  public static void Once(string text) { lock(Gate) { if(Seen.Add(text)) Note(text); } }
+                  public static void Enter(string method) {
+                      if(method=="Update") Interlocked.Increment(ref updates);
+                      if(method=="Draw") Interlocked.Increment(ref draws);
+                      Once("ENTER original "+method);
+                  }
+                  public static void Returned(string method) { Once("RETURN original "+method); }
+                  public static void Stop(Exception error,string stage) {
+                      Interlocked.Exchange(ref failed,1);
+                      while(error is TargetInvocationException && error.InnerException!=null) error=error.InnerException;
+                      Note("STOPPED at "+stage+": "+error);
+                  }
+                  public static string Snapshot() {
+                      lock(Gate) {
+                          int first=Math.Max(0,Lines.Count-12);
+                          return "CMZ ORIGINAL STARTUP 0.9 - EXPERIMENTAL\n" +
+                              string.Join("\n",Lines.GetRange(first,Lines.Count-first))+
+                              "\nOriginal calls: update="+Interlocked.Read(ref updates)+" draw="+Interlocked.Read(ref draws)+
+                              "\nLog: LocalState/cmz-startup-log.txt";
+                      }
+                  }
+                  // The original console-only affinity hint does not describe this CPU's topology.
+                  // Retain the host scheduler rather than pin to arbitrary Xbox 360 thread indices.
+                  public static void ConsoleAffinity(System.Threading.Thread thread,int[] cores) {
+                      if(thread==null || cores==null) throw new ArgumentNullException();
+                      Once("PORT ADAPTATION: console CPU-affinity hint ignored; using the Xbox host scheduler.");
+                  }
+                  public static void BeforeConstruction(Assembly game,Assembly engine) {
+                      var type=engine.GetType("DNA.Reflection.ReflectionTools",true);
+                      var register=type.GetMethod("RegisterAssembly",BindingFlags.Public|BindingFlags.Static,
+                          null,new Type[]{typeof(Assembly),typeof(Assembly)},null);
+                      if(register==null) throw new MissingMethodException(type.FullName,"RegisterAssembly");
+                      register.Invoke(null,new object[]{game,engine});
+                      Once("Original game/engine reflection registration completed.");
+                  }
+                  public static void AfterConstruction(Game game) {
+                      game.Content=new StartupContentManager(game.Services);
+                      var manager=game.Services.GetService(typeof(IGraphicsDeviceManager)) as GraphicsDeviceManager;
+                      if(manager==null) throw new InvalidOperationException("Original constructor did not register a GraphicsDeviceManager.");
+                      manager.GraphicsProfile=GraphicsProfile.HiDef;
+                      manager.PreferredBackBufferWidth=1280;
+                      manager.PreferredBackBufferHeight=720;
+                      manager.SynchronizeWithVerticalRetrace=true;
+                      game.IsFixedTimeStep=true;
+                      game.TargetElapsedTime=TimeSpan.FromSeconds(1.0/60.0);
+                      game.IsMouseVisible=false;
+                      Once("Original CastleMinerZGame constructor returned; original game owns the graphics manager.");
+                  }
+              }
+          }
+          ''')
+      - name: Write THIRD-PARTY-NOTICES.txt (1/1)
+        shell: python
+        run: |
+          from pathlib import Path
+          path = Path("xbox-cmz-services") / 'THIRD-PARTY-NOTICES.txt'
+          path.parent.mkdir(parents=True, exist_ok=True)
+          with path.open('w', encoding="utf-8", newline="") as output:
+              output.write(r'''CMZ SERVICES CHECK 0.6
+          Adapted Nexia/Xenia XNA signatures and storage code (BSD-3-Clause).
+          See NEXIA-LICENSE.txt and SOURCE-PROVENANCE.json for precise attribution.
+          Nexia signatures are not evidence of implemented gameplay or avatar services.
+          New local behavior is experimental and is clearly separated from guarded declarations.
+
+          CMZ ASSEMBLY LOADER 0.5 - ORIGINAL EXPERIMENT CODE
+          No CastleMiner Z binary, asset or complete Nexia emulator is included.
+          Uses legacy MonoGame.Framework.WindowsUniversal 3.8.1.303.
+          See included MONOGAME-LICENSE.txt (Ms-PL and MIT). SharpDX packages use MIT.
+          No contributor or publisher endorsement is claimed.
+
+          Mono.Cecil 0.11.6 (NuGet)
+          https://github.com/jbevain/cecil/blob/0.11.6/LICENSE.txt
+
+          Copyright (c) 2008 - 2015 Jb Evain
+          Copyright (c) 2008 - 2011 Novell, Inc.
+
+          Permission is hereby granted, free of charge, to any person obtaining
+          a copy of this software and associated documentation files (the
+          "Software"), to deal in the Software without restriction, including
+          without limitation the rights to use, copy, modify, merge, publish,
+          distribute, sublicense, and/or sell copies of the Software, and to
+          permit persons to whom the Software is furnished to do so, subject to
+          the following conditions:
+
+          The above copyright notice and this permission notice shall be
+          included in all copies or substantial portions of the Software.
+
+          THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+          EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+          MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+          NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+          LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+          OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+          WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+          Microsoft.NETCore.UniversalWindowsPlatform 6.2.14 and its runtime dependencies
+          are restored from the official NuGet feed under their applicable package licenses.
+          Microsoft runtime packages retain their packaged manifests and signatures.
+
+          0.7 modifications: private MonoGame TitleContainer.OpenStream routes to the app-local content bridge.
+          New startup host code does not alter shared framework packages.
+
+          0.8 original code: endian-aware XACT reader, validated in-memory PCM conversion, trial-only development policy and synthetic tests. No FAudio binary or code is included. See SOURCE-PROVENANCE.json.
+
+          0.9 original code: SpriteBatch overload-forwarding IL generator; guarded music-bank constructor redirection; verified private PCM input importer and validator; synthetic executable fixture tests. No original game or music included here.
+          Offline conversion tooling uses FFmpeg already installed on the processing machine, not in the Xbox app. WMA mini-format facts checked against vgmstream src/meta/xwb.c at 7c520e8f9b078dfde2f84f1b5bcbad0c6c415806. No vgmstream binary or decoder source is included.
+          ''')
+      - name: Write build.ps1 (1/1)
+        shell: python
+        run: |
+          from pathlib import Path
+          path = Path("xbox-cmz-services") / 'build.ps1'
+          path.parent.mkdir(parents=True, exist_ok=True)
+          with path.open('w', encoding="utf-8", newline="") as output:
+              output.write(r'''param([ValidateRange(1,65535)][int]$BuildNumber = 1)
+          $ErrorActionPreference = 'Stop'
+          Set-StrictMode -Version Latest
+          $root = $PSScriptRoot
+          $out = Join-Path $root 'out'
+          $packages = Join-Path $root 'AppPackages'
+          New-Item -ItemType Directory -Force $out, "$root\Assets", "$out\Dependencies", $packages | Out-Null
+          Start-Transcript -Path "$out\build-transcript.txt" -Force | Out-Null
+          try {
+              $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+              if (!(Test-Path $vswhere)) { throw 'Visual Studio locator is missing.' }
+              $vs = & $vswhere -latest -products '*' -version '[17.0,18.0)' -property installationPath
+              if (!$vs) { throw 'Visual Studio 2022 is required.' }
+              $msbuild = Join-Path $vs 'MSBuild\Current\Bin\MSBuild.exe'
+              $kits = "${env:ProgramFiles(x86)}\Windows Kits\10"
+              $versions = @(Get-ChildItem "$kits\bin" -Directory | Where-Object {
+                  $_.Name -match '^10\.0\.\d+\.0$' -and
+                  (Test-Path (Join-Path $_.FullName 'x64\makeappx.exe')) -and
+                  (Test-Path (Join-Path $_.FullName 'x64\signtool.exe'))
+              } | Sort-Object { [version]$_.Name } -Descending)
+              if (!$versions.Count) { throw 'Windows SDK packaging tools are missing.' }
+              $sdk = $versions[0].Name
+              if (@($versions | Where-Object Name -eq '10.0.19041.0').Count) { $sdk = '10.0.19041.0' }
+              Write-Host "Visual Studio: $vs"
+              Write-Host "SDK: $sdk; managed UWP Debug x64; .NET Native DISABLED intentionally"
+
+              Add-Type -AssemblyName System.Drawing
+              foreach ($asset in @(@('StoreLogo.png',50,50), @('Square44.png',44,44), @('Square150.png',150,150), @('Splash.png',620,300))) {
+                  $bitmap = [Drawing.Bitmap]::new([int]$asset[1], [int]$asset[2])
+                  $graphics = [Drawing.Graphics]::FromImage($bitmap)
+                  $brush = [Drawing.SolidBrush]::new([Drawing.Color]::FromArgb(230,180,70))
+                  try {
+                      $graphics.Clear([Drawing.Color]::FromArgb(16,24,32))
+                      $graphics.FillRectangle($brush, [int]($asset[1]/4), [int]($asset[2]/4), [int]($asset[1]/2), [int]($asset[2]/2))
+                      $bitmap.Save((Join-Path "$root\Assets" $asset[0]), [Drawing.Imaging.ImageFormat]::Png)
+                  } finally { $brush.Dispose(); $graphics.Dispose(); $bitmap.Dispose() }
+              }
+              [xml]$manifest = Get-Content "$root\Package.appxmanifest" -Raw
+              $manifest.Package.Identity.Version = "0.9.$BuildNumber.0"
+              $manifest.Package.Dependencies.TargetDeviceFamily.MaxVersionTested = $sdk
+              $manifest.Save("$root\Package.appxmanifest")
+
+              # Test the exact new reader/converter source using synthetic inputs, not game data.
+              & dotnet run --project "$root\XactTests\XactTests.csproj" --configuration Release 2>&1 | Tee-Object -FilePath "$out\xact-unit-tests.log"
+              if ($LASTEXITCODE -ne 0) { throw 'XACT reader/converter unit tests failed. No package will be published.' }
+              & dotnet run --project "$root\Startup09Tests\Startup09Tests.csproj" --configuration Release 2>&1 | Tee-Object -FilePath "$out\startup09-unit-tests.log"
+              if ($LASTEXITCODE -ne 0) { throw '0.9 IL forwarding and PCM bank tests failed. No package will be published.' }
+              & $msbuild "$root\ManagedProbe.csproj" /restore /m /t:Build /v:minimal `
+                  /p:Configuration=Debug /p:Platform=x64 "/p:TargetPlatformVersion=$sdk" `
+                  /p:UseDotNetNativeToolchain=false /p:AppxPackageSigningEnabled=false `
+                  /p:GenerateAppxPackageOnBuild=true /p:AppxBundle=Never `
+                  /p:UapAppxPackageBuildMode=SideloadOnly "/p:AppxPackageDir=$packages\" `
+                  "/flp:LogFile=$out\msbuild.log;Verbosity=normal" `
+                  "/bl:$out\build.binlog"
+              if ($LASTEXITCODE -ne 0) { throw "Managed UWP build failed ($LASTEXITCODE). See build.binlog and transcript." }
+
+              Get-ChildItem $packages -Recurse -File | Select-Object FullName,Length | Format-Table -AutoSize | Out-String -Width 300 | Set-Content "$out\package-inventory.txt"
+              $apps = @(Get-ChildItem $packages -Recurse -File | Where-Object {
+                  $_.Extension -in @('.appx', '.msix') -and $_.FullName -notmatch '[\\/]Dependencies[\\/]'
+              })
+              if ($apps.Count -ne 1) { throw "Expected one main APPX; found $($apps.Count)." }
+              $package = Join-Path $root "NexiaCMZLoader_0.9.${BuildNumber}.0_x64$($apps[0].Extension)"
+              # Modify only this unsigned app's copy of MonoGame, then regenerate package metadata.
+              # No installed framework package, original game file or OS file is modified.
+              $stage = Join-Path $root 'startup-package-stage'
+              if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
+              & "$kits\bin\$sdk\x64\makeappx.exe" unpack /p $apps[0].FullName /d $stage /o
+              if ($LASTEXITCODE -ne 0) { throw 'Could not unpack unsigned startup package.' }
+              & dotnet run --project "$root\PackagingTool\PackagingTool.csproj" --configuration Release -- $stage 2>&1 | Tee-Object -FilePath "$out\packaging-patch-checks.log"
+              if ($LASTEXITCODE -ne 0) { throw 'Private MonoGame file bridge patch failed.' }
+              foreach ($metadata in @('AppxBlockMap.xml', '[Content_Types].xml', 'AppxSignature.p7x', 'AppxMetadata\CodeIntegrity.cat')) {
+                  $file = Join-Path $stage $metadata
+                  if (Test-Path -LiteralPath $file) { Remove-Item -LiteralPath $file -Force }
+              }
+              & "$kits\bin\$sdk\x64\makeappx.exe" pack /d $stage /p $package /o
+              if ($LASTEXITCODE -ne 0) { throw 'Could not repack unsigned startup package.' }
+              $dependencyFiles = @(Get-ChildItem $packages -Recurse -File | Where-Object {
+                  $_.Extension -in @('.appx', '.msix') -and $_.FullName -match '[\\/]Dependencies[\\/]' -and $_.FullName -match '[\\/](x64|neutral)[\\/]'
+              })
+              foreach ($dependency in $dependencyFiles) {
+                  Copy-Item $dependency.FullName (Join-Path "$out\Dependencies" $dependency.Name) -Force
+              }
+
+              # Fail visibly if a declared dependency is not included. Do not substitute
+              # a desktop .NET runtime or assume it is already installed on the Xbox.
+              Add-Type -AssemblyName System.IO.Compression.FileSystem
+              function Read-AppxManifest([string]$Path) {
+                  $archive = [IO.Compression.ZipFile]::OpenRead($Path)
+                  try {
+                      $entry = $archive.GetEntry('AppxManifest.xml')
+                      if (!$entry) { throw "Missing APPX manifest: $Path" }
+                      $reader = [IO.StreamReader]::new($entry.Open())
+                      try { return [xml]$reader.ReadToEnd() } finally { $reader.Dispose() }
+                  } finally { $archive.Dispose() }
+              }
+              $contentsCheck = [IO.Compression.ZipFile]::OpenRead($package)
+              try {
+                  foreach ($requiredFile in @('MonoGame.Framework.dll', 'Mono.Cecil.dll')) {
+                      if (!$contentsCheck.GetEntry($requiredFile)) { throw "Required assembly missing: $requiredFile" }
+                  }
+                  foreach ($entry in $contentsCheck.Entries) {
+                      if ($entry.FullName -match '(^|[/\\])(CastleMinerZ\.exe|DNA\.Common\.dll|CastleMinerZ-assemblies\.zip|CastleMinerZ-startup-content\.zip|CastleMinerZ-music-pcm\.zip|SoundsStreaming\.pcm\.xwb)$') {
+                          throw 'Original game files must not be in the public build artifact.'
+                      }
+                  }
+              } finally { $contentsCheck.Dispose() }
+              $mainManifest = Read-AppxManifest $package
+              if ($mainManifest.Package.Identity.Name -ne 'NexiaCMZLoader' -or
+                  $mainManifest.Package.Identity.Publisher -ne 'CN=NexiaCMZLoader' -or
+                  $mainManifest.Package.Identity.ProcessorArchitecture -ne 'x64') {
+                  throw 'Unexpected package identity, publisher or architecture.'
+              }
+              $available = @{}
+              foreach ($file in @(Get-ChildItem "$out\Dependencies" -File | Where-Object { $_.Extension -in @('.appx', '.msix') })) {
+                  $dependencyManifest = Read-AppxManifest $file.FullName
+                  $identity = $dependencyManifest.Package.Identity
+                  $available[[string]$identity.Name] = [version]$identity.Version
+                  Write-Host "Included dependency: $($identity.Name) $($identity.Version)"
+              }
+              $required = @($mainManifest.SelectNodes('//*[local-name()="PackageDependency"]'))
+              foreach ($dependency in $required) {
+                  $name = $dependency.GetAttribute('Name')
+                  $minimum = [version]$dependency.GetAttribute('MinVersion')
+                  if (!$available.ContainsKey($name) -or $available[$name] -lt $minimum) {
+                      throw "Missing packaged dependency: $name >= $minimum. Return the build logs; do not install random runtime files."
+                  }
+              }
+              if (@($required | Where-Object { $_.GetAttribute('Name') -like 'Microsoft.NET.Native*' }).Count) {
+                  throw 'This diagnostic unexpectedly targets .NET Native rather than the intended managed runtime.'
+              }
+              if (!@($required | Where-Object { $_.GetAttribute('Name') -like 'Microsoft.NET.CoreRuntime*' }).Count) {
+                  throw 'Expected a UWP CoreRuntime dependency; inspect the manifest before testing.'
+              }
+              $mainManifest.OuterXml | Set-Content "$out\packaged-manifest.xml" -Encoding utf8
+
+              $cert = New-SelfSignedCertificate -Type Custom -Subject 'CN=NexiaCMZLoader' `
+                  -KeyUsage DigitalSignature -KeyAlgorithm RSA -KeyLength 2048 -HashAlgorithm SHA256 `
+                  -CertStoreLocation 'Cert:\CurrentUser\My' `
+                  -TextExtension @('2.5.29.37={text}1.3.6.1.5.5.7.3.3') -NotAfter (Get-Date).AddMonths(6)
+              try {
+                  & "$kits\bin\$sdk\x64\signtool.exe" sign /fd SHA256 /s My /sha1 $cert.Thumbprint $package
+                  if ($LASTEXITCODE -ne 0) { throw 'APPX signing failed.' }
+                  Export-Certificate -Cert $cert -FilePath "$out\NexiaCMZLoader.cer" | Out-Null
+              } finally { Remove-Item "Cert:\CurrentUser\My\$($cert.Thumbprint)" -ErrorAction SilentlyContinue }
+              Copy-Item "$root\MONOGAME-LICENSE.txt" $out
+              Copy-Item "$root\SOURCE-PROVENANCE.json" $out
+              Copy-Item $package $out
+              Copy-Item "$root\README.txt", "$root\NEXIA-LICENSE.txt", "$root\THIRD-PARTY-NOTICES.txt" $out
+              Get-FileHash $package -Algorithm SHA256 | Format-List | Out-File "$out\SHA256.txt"
+              Write-Host 'CMZ STARTUP UPDATE BUILT. Original constructor/initialization and content loading remain untested on Xbox.'
+          } finally { Stop-Transcript | Out-Null }
+          ''')
+      - name: Write README.txt (1/1)
+        shell: python
+        run: |
+          from pathlib import Path
+          path = Path("xbox-cmz-services") / 'README.txt'
+          path.parent.mkdir(parents=True, exist_ok=True)
+          with path.open('w', encoding="utf-8", newline="") as output:
+              output.write(r'''CMZ ORIGINAL STARTUP 0.9 — SPRITE OVERLOADS + RESIDENT MUSIC
+          Experimental compatibility update; not a verified playable or split-screen port.
+
+          USER ACTION NOW
+          Replace only the contents of .github/workflows/xbox-cmz-startup.yml on Mousehook.
+          No new workflow path. Keep installed CMZ Assembly Loader in Game mode; do not uninstall.
+          The public cloud build never downloads/includes CastleMiner Z binaries or assets.
+
+          WHAT THE 0.8 LOG ESTABLISHES
+          The original constructor, Initialize and initial font load completed. AudioEngine,
+          SoundBank and the 127-track PCM WaveBank constructors returned. This is not proof of
+          sound playback. Draw failed at SpriteBatch.Begin with five parameters; SecondaryLoad
+          failed while playing music through MonoGame's unimplemented streaming method.
+
+          0.9 IMPLEMENTATION
+          1. Adds exact SpriteBatch.Begin overloads with 0, 2 and 5 parameters to the private
+             app copy of MonoGame. Those are the arities referenced in the user's two original
+             assemblies. Each forwards supplied states to the existing seven-argument method,
+             using Deferred where omitted and null for omitted states/effect/transform. It does
+             not replace Screen.Draw, skip drawing, or change the original state defaults.
+          2. Accepts a separate hash-checked CastleMinerZ-music-pcm.zip private input. It contains
+             the user's eleven original compressed music-bank tracks decoded offline to PCM16,
+             in a rebuilt little-endian bank with original bank name and track ordering.
+          3. Redirects only the known zero-offset Content/SoundsStreaming.xwb request to the
+             non-streaming WaveBank constructor. The loaded decoded bank uses about 112 MiB of
+             sample data. The original sound cues, variation selection and mixing code remain.
+             This is resident audio, NOT a native WMA streaming decoder. No silent substitutes
+             or no-op music handlers are used. Unexpected paths/offsets/packet sizes still fail.
+          4. Import and startup failures are reported in the existing logs. No shared Microsoft
+             framework package or other Xbox application is modified.
+
+          PRIVATE MUSIC PREPARATION RESULTS
+          Eleven tracks were decoded with installed FFmpeg 7.1.5. All eleven decodes exited 0
+          with no error-level output. Python checked input hashes, stream ranges, output lengths,
+          channels/rates, nonzero output, bank metadata, track order, and PCM hashes after repacking.
+          Two mono tracks decoded 512 samples shorter than the source duration metadata; remaining
+          tracks matched. The rebuilt bank records actual decoded lengths rather than padding or
+          claiming sample-exact equivalence. All source sample-loop regions were zero. Audibility,
+          cue timing, loop fidelity, mixing, performance and Xbox playback remain unverified.
+          See offline-tools/music-conversion-report.json and prepare_music_pcm.py.
+          The original input archives and extracted original game files were not modified.
+
+          BUILD GATES
+          Existing 0.8 XACT tests run first. New Startup09Tests compiles the exact patch generator,
+          executes patched overloads and constructors against synthetic recording fixtures, checks
+          arguments/defaults and invalid-request rejection, and tests the PCM bank validator.
+          The synthetic fixture uses no MonoGame implementation, GPU, game or audio content.
+          The packager then verifies patched methods against the actual UWP MonoGame DLL before
+          signing. These new C# tests and the new Windows build have NOT run at preparation time.
+
+          INSTALLATION AFTER AN INSPECTED SUCCESSFUL BUILD
+          Update NexiaCMZLoader (same Name/Publisher, version 0.9.<run>.0), keep Game mode.
+          Retain LocalState/CastleMinerZ-assemblies.zip and CastleMinerZ-startup-content.zip.
+          Add CastleMinerZ-music-pcm.zip directly beside those two files in LocalState, intact.
+          Do not unzip it manually, replace the earlier ZIPs, or upload any game/music files to GitHub.
+          Launch once; confirm any displayed scene and audible music with volume initially low.
+          Send cmz-startup-log.txt and cmz-loader-log.txt before relaunching (logs reset at launch).
+          No second controller is needed for this startup compatibility test.
+
+          REMAINING LIMITS
+          Original shaders/models/avatars and the other guarded services may be the next blockers.
+          Trial-only host policy remains unchanged. Couch co-op remains a target, not a completed
+          feature. This update does not render multiple local views or implement independent game
+          player state, controller join, online play or full-version licensing.
+
+          ATTRIBUTION
+          Original 0.9 adapter/import/test code. Included earlier code preserves attribution in
+          NEXIA-LICENSE.txt, MONOGAME-LICENSE.txt, THIRD-PARTY-NOTICES.txt and SOURCE-PROVENANCE.json.
+          Offline conversion uses installed FFmpeg; no FFmpeg/vgmstream binary is packaged for Xbox.
+          Lookup facts checked against vgmstream's xwb.c at commit
+          7c520e8f9b078dfde2f84f1b5bcbad0c6c415806. No original game/audio binary is in this source ZIP.
+          ''')
+
+      - name: Test adapters, build and sign startup update
+        shell: pwsh
+        env:
+          PROBE_BUILD_NUMBER: ${{ github.run_number }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tokens = $null
+          $parseErrors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            "$PWD/xbox-cmz-services/build.ps1", [ref]$tokens, [ref]$parseErrors
+          ) | Out-Null
+          if ($parseErrors.Count -gt 0) { throw ($parseErrors | Out-String) }
+          ./xbox-cmz-services/build.ps1 -BuildNumber ([int]$env:PROBE_BUILD_NUMBER)
+
+      - name: Upload signed update or failure logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: XboxCMZStartup-x64-${{ github.run_number }}
+          path: xbox-cmz-services/out/
+          retention-days: 7
+          if-no-files-found: warn
