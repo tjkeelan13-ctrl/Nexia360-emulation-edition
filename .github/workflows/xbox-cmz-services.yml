@@ -1,0 +1,2227 @@
+# Create this workflow from the repository ROOT. Keep old workflow files unchanged.
+# Builds an update to CMZ Assembly Loader. No original game binaries are included.
+name: Xbox - CMZ Services Bridge
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [Mousehook]
+    paths:
+      - '.github/workflows/xbox-cmz-services.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: xbox-cmz-services-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 25
+    steps:
+      - name: Write App.xaml (1 of 1)
+        shell: python
+        run: |
+          from pathlib import Path
+          root = Path("xbox-cmz-services")
+          root.mkdir(exist_ok=True)
+          with (root / 'App.xaml').open('w', encoding="utf-8", newline="") as output:
+              output.write(r'''<Application
+              x:Class="NexiaCMZLoader.App"
+              xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+              RequestedTheme="Dark">
+              <Application.Resources />
+          </Application>
+          ''')
+      - name: Write App.xaml.cs (1 of 1)
+        shell: python
+        run: |
+          from pathlib import Path
+          root = Path("xbox-cmz-services")
+          root.mkdir(exist_ok=True)
+          with (root / 'App.xaml.cs').open('w', encoding="utf-8", newline="") as output:
+              output.write(r'''using System;
+          using System.IO;
+          using System.Threading.Tasks;
+          using Windows.ApplicationModel.Activation;
+          using Windows.Storage;
+          using Windows.UI.Xaml;
+          using Windows.UI.Xaml.Controls;
+          using Windows.UI.Xaml.Media;
+
+          namespace NexiaCMZLoader
+          {
+              sealed partial class App : Application
+              {
+                  private bool launched;
+                  public App()
+                  {
+                      InitializeComponent();
+                      RequiresPointerMode = ApplicationRequiresPointerMode.WhenRequested;
+                  }
+                  protected override async void OnLaunched(LaunchActivatedEventArgs args)
+                  {
+                      if (launched) { Window.Current.Activate(); return; }
+                      launched = true;
+                      var output = new TextBlock {
+                          Text = "CASTLEMINER Z ASSEMBLY SERVICES CHECK 0.6\nChecking original game assemblies...\nThis is not playable yet.",
+                          FontSize = 22, TextWrapping = TextWrapping.Wrap,
+                          Foreground = new SolidColorBrush(Windows.UI.Colors.White),
+                          Margin = new Thickness(48, 32, 48, 32)
+                      };
+                      Window.Current.Content = new ScrollViewer {
+                          Content = output, VerticalScrollBarVisibility = ScrollBarVisibility.Auto
+                      };
+                      Window.Current.Activate();
+                      string folder = ApplicationData.Current.LocalFolder.Path;
+                      try {
+                          output.Text = await Task.Run(() => new CmzLoader(folder).Run());
+                      } catch (Exception ex) {
+                          output.Text = "LOADER ERROR\n" + ex + "\nNo game was started.";
+                          try { File.AppendAllText(Path.Combine(folder, "cmz-loader-log.txt"), ex.ToString()); }
+                          catch { }
+                      }
+                  }
+              }
+          }
+          ''')
+      - name: Write CmzLoader.cs (1 of 2)
+        shell: python
+        run: |
+          from pathlib import Path
+          root = Path("xbox-cmz-services")
+          root.mkdir(exist_ok=True)
+          with (root / 'CmzLoader.cs').open('w', encoding="utf-8", newline="") as output:
+              output.write(r'''// Read-only original inputs; retargeted copies belong to this test app only.
+          // No Main, game constructor, gameplay, online service or avatar is executed.
+          using System;
+          using System.Collections.Generic;
+          using System.IO;
+          using System.IO.Compression;
+          using System.Linq;
+          using System.Reflection;
+          using System.Security.Cryptography;
+          using Mono.Cecil;
+          using Windows.System.Profile;
+
+          namespace NexiaCMZLoader
+          {
+              internal sealed class CmzLoader
+              {
+                  private readonly string folder;
+                  private readonly string logPath;
+                  private readonly List<string> summary = new List<string>();
+                  private readonly List<Assembly> providers = new List<Assembly>();
+                  private readonly Dictionary<string, Type> typeCache = new Dictionary<string, Type>();
+                  private readonly HashSet<string> unresolved = new HashSet<string>();
+                  private object context;
+                  private MethodInfo loadStream;
+                  private int mapped;
+
+                  internal CmzLoader(string localFolder)
+                  {
+                      folder = localFolder;
+                      logPath = Path.Combine(folder, "cmz-loader-log.txt");
+                  }
+                  private void Log(string text) { File.AppendAllText(logPath, text + "\r\n"); }
+                  private void Show(string text) { summary.Add(text); Log(text); }
+                  internal string Run()
+                  {
+                      File.WriteAllText(logPath, "CMZ assembly check " + DateTime.UtcNow.ToString("O") + "\r\n");
+                      Show("CASTLEMINER Z ASSEMBLY SERVICES CHECK 0.6 - NOT PLAYABLE");
+                      Show("Device: " + AnalyticsInfo.VersionInfo.DeviceFamily);
+                      Log("Runtime: " + typeof(object).Assembly.FullName);
+                      Log("Couch co-op requirement: two independent local players sharing one world. NOT implemented here.");
+                      string zipPath = Path.Combine(folder, "CastleMinerZ-assemblies.zip");
+                      if (!File.Exists(zipPath)) {
+                          Show("WAITING FOR YOUR GAME FILES");
+                          Show("Upload CastleMinerZ-assemblies.zip into this app's LocalState.");
+                          Show("Keep the ZIP intact, then fully close and reopen this app.");
+                          return string.Join("\n", summary);
+                      }
+                      try {
+                          string originals = Path.Combine(folder, "OriginalAssemblies");
+                          string prepared = Path.Combine(folder, "PreparedAssemblies");
+                          Directory.CreateDirectory(originals);
+                          Directory.CreateDirectory(prepared);
+                          Import(zipPath, originals);
+                          Show("Original CastleMinerZ.exe + DNA.Common.dll: verified");
+                          DiscoverContext();
+                          Show("Public stream loader: available");
+                          try { Show("Offline services: " + LocalServiceTests.Run(folder)); }
+                          catch (Exception serviceError) { Show("Offline service self-test FAILED: " + serviceError.GetType().Name); Log(serviceError.ToString()); }
+                          Show("Avatar / online / guide UI APIs are guarded declarations, NOT implemented services.");
+                          AddProvider(typeof(LocalServiceTests).Assembly);
+                          AddProvider(typeof(object).Assembly);
+                          AddProvider(typeof(Enumerable).Assembly);
+                          AddProvider(typeof(File).Assembly);
+                          AddProvider(typeof(Uri).Assembly);
+                          AddProvider(typeof(System.Threading.Thread).Assembly);
+                          AddProvider(typeof(Microsoft.Xna.Framework.Game).Assembly);
+                          foreach (string name in new[] { "System.Runtime", "System.Collections", "System.Linq",
+                              "System.IO", "System.Reflection", "System.Threading", "System.Threading.Tasks",
+                              "System.Xml.ReaderWriter", "System.Xml.XDocument", "System.Net.Primitives",
+                              "System.Net.Sockets", "System.Runtime.Extensions", "System.Globalization",
+                              "System.Console", "System.Threading.Thread", "System.Text.RegularExpressions",
+                              "System.Diagnostics.Tools", "System.IO.IsolatedStorage", "System.ComponentModel.Primitives" }) {
+                              try { AddProvider(Assembly.Load(new AssemblyName(name))); }
+                              catch (Exception ex) { Log("Optional type provider " + name + ": " + ex.Message); }
+                          }
+                          string[] names = { "DNA.Common.dll", "CastleMinerZ.exe" };
+                          foreach (string name in names) {
+                              Retarget(Path.Combine(originals, name), Path.Combine(prepared, name));
+                          }
+                          Show("Framework type references mapped: " + mapped + " (includes guarded declarations)");
+                          Show("Unresolved framework type names: " + unresolved.Count + " (details in log)");
+                          foreach (string missing in unresolved.OrderBy(x => x)) Log("UNMAPPED " + missing);
+                          var loaded = new Dictionary<string, Assembly>();
+                          foreach (string name in names) {
+                              try {
+                                  Assembly assembly;
+                                  using (var stream = new MemoryStream(File.ReadAllBytes(Path.Combine(prepared, name))))
+                                      assembly = (Assembly)loadStream.Invoke(context, new object[] { stream });
+                                  loaded.Add(name, assembly);
+                                  Show(name + ": assembly loaded");
+                                  Log("Loaded identity: " + assembly.FullName);
+                                  InspectTypes(name, assembly);
+                                  InspectSignatures(name, assembly);
+                              } catch (Exception ex) {
+                                  ex = Unwrap(ex);
+                                  Show(name + ": LOAD FAILED " + ex.GetType().Name);
+                                  Log(ex.ToString());
+                              }
+                          }
+                          Assembly game;
+                          if (loaded.TryGetValue("CastleMinerZ.exe", out game)) {
+                              try {
+                                  Type type = game.GetType("DNA.CastleMinerZ.CastleMinerZGame", true);
+                                  bool correctBase = typeof(Microsoft.Xna.Framework.Game).IsAssignableFrom(type);
+                                  Show("Actual game class linked to MonoGame: " + correctBase);
+                                  Log("Game constructors: " + string.Join("; ", type.GetConstructors().Select(c => c.ToString())));
+                              } catch (Exception ex) {
+                                  ex = Unwrap(ex);
+                                  Show("Actual game class: BLOCKED " + ex.GetType().Name);
+                                  Log(ex.ToString());
+                              }
+                          }
+                          Show("CHECK COMPLETE - game NOT started; avatars and couch gameplay NOT implemented.");
+                          Show("Send this screen and LocalState/cmz-loader-log.txt.");
+                      } catch (Exception ex) {
+                          ex = Unwrap(ex);
+                          Show("CHECK STOPPED: " + ex.GetType().Name + ": " + ex.Message);
+                          Log(ex.ToString());
+                          Show("Send LocalState/cmz-loader-log.txt. Do not replace system runtime files.");
+                      }
+                      return string.Join("\n", summary);
+                  }
+                  private void Import(string zipPath, string destination)
+                  {
+                      var hashes = new Dictionary<string, string>(StringComparer.Ordinal) {
+                          { "CastleMinerZ.exe", "e378b91ed3c088e8d89094213e5eb064737957c05164ae84a22e4fc766f903a4" },
+                          { "DNA.Common.dll", "642853463e0bbdf310ee88956af41cb5c2db5814a12255674ed61e383f8b3d59" }
+                      };
+                      if (new FileInfo(zipPath).Length > 4 * 1024 * 1024)
+                          throw new InvalidDataException("Expected the small two-assembly ZIP, not an entire game archive.");
+                      using (var input = File.OpenRead(zipPath))
+                      using (var archive = new ZipArchive(input, ZipArchiveMode.Read)) {
+                          if (archive.Entries.Count != 2) throw new InvalidDataException("Expected exactly two original assemblies.");
+                          var seen = new HashSet<string>(StringComparer.Ordinal);
+                          foreach (var entry in archive.Entries) {
+                              string expected;
+                              if (!hashes.TryGetValue(entry.FullName, out expected) || !seen.Add(entry.FullName))
+                                  throw new InvalidDataException("Unexpected or duplicate ZIP entry: " + entry.FullName);
+                              long expectedLength = entry.FullName == "CastleMinerZ.exe" ? 439296 : 610304;
+                              if (entry.Length != expectedLength) throw new InvalidDataException("Original assembly size mismatch.");
+                              var bytes = new byte[(int)expectedLength];
+                              using (var stream = entry.Open()) {
+                                  int offset = 0;
+                                  while (offset < bytes.Length) {
+                                      int count = stream.Read(bytes, offset, bytes.Length - offset);
+                                      if (count == 0) throw new EndOfStreamException("Incomplete game assembly in ZIP.");
+                                      offset += count;
+                                  }
+                                  if (stream.ReadByte() != -1) throw new InvalidDataException("Oversized ZIP entry.");
+                              }
+                              string actual;
+                              using (var hash = SHA256.Create())
+                                  actual = BitConverter.ToString(hash.ComputeHash(bytes)).Replace("-", "").ToLowerInvariant();
+                              if (actual != expected) throw new InvalidDataException("Game assembly hash mismatch: " + entry.FullName);
+                              File.WriteAllBytes(Path.Combine(destination, entry.FullName), bytes);
+                              Log("Original verified: " + entry.FullName + " " + actual);
+                          }
+                      }
+                  }
+                  private void DiscoverContext()
+                  {
+                      Type type = typeof(object).Assembly.GetType("System.Runtime.Loader.AssemblyLoadContext");
+                      if (type == null || !type.IsPublic) throw new NotSupportedException("Public load context unavailable.");
+                      var property = type.GetProperty("Default", BindingFlags.Public | BindingFlags.Static);
+                      context = property == null ? null : property.GetValue(null);
+                      loadStream = type.GetMethod("LoadFromStream", BindingFlags.Public | BindingFlags.Instance,
+                          null, new Type[] { typeof(Stream) }, null);
+                      if (context == null || loadStream == null) throw new NotSupportedException("Public stream loading unavailable.");
+                      Log("Context: " + context.GetType().FullName);
+                  }
+                  private void AddProvider(Assembly assembly)
+                  {
+                      if (!providers.Contains(assembly)) providers.Add(assembly);
+                  }
+                  private static bool PublicType(Type type) { return type != null && (type.IsPublic || type.IsNestedPublic); }
+                  private Type RuntimeType(string name, bool xna)
+                  {
+                      string key = (xna ? "XNA:" : "BCL:") + name;
+                      Type cached;
+                      if (typeCache.TryGetValue(key, out cached)) return cached;
+                      string full = name.Replace('/', '+');
+                      // A non-public CoreLib lookalike must not stop the search for a public facade type.
+                      var candidates = xna
+                          ? new [] { typeof(LocalServiceTests).Assembly, typeof(Microsoft.Xna.Framework.Game).Assembly }
+                          : providers.ToArray();
+                      foreach (var provider in candidates) {
+                          Type type = null;
+                          try { type = provider.GetType(full, false); }
+                          catch (Exception ex) { Log("TYPE PROVIDER " + provider.GetName().Name + " " + full + ": " + ex.Message); }
+                          if (!PublicType(type)) continue;
+                          typeCache[key] = type;
+                          Log("MAP " + key + " -> " + type.Assembly.GetName().Name);
+                          return type;
+                      }
+                      if (!xna) {
+                          Type type = Type.GetType(full, false);
+                          if (PublicType(type)) { typeCache[key]=type; return type; }
+                      }
+                      typeCache[key]=null;
+                      return null;
+                  }
+                  private void Retarget(string original, string output)
+                  {
+                      using (var definition = AssemblyDefinition.ReadAssembly(original, new ReaderParameters {
+                          ReadingMode = ReadingMode.Deferred, ReadSymbols = false
+                      })) {
+                          var module = definition.MainModule;
+                          if ((module.Attributes & ModuleAttributes.ILOnly) == 0)
+                              throw new NotSupportedException("Only pure managed IL is accepted.");
+                          Log("Original " + Path.GetFileName(original) + " metadata " + module.RuntimeVersion);
+                          foreach (var reference in module.AssemblyReferences) Log("Assembly reference: " + reference.FullName);
+                          // Rewrite copies only. Unknown APIs remain unknown rather than being replaced with no-op stubs.
+                          // Capture original scopes first: rewriting a parent must not hide a nested reference.
+                          var references = module.GetTypeReferences().Select(reference => {
+                              TypeReference outer = reference;
+          ''')
+      - name: Write CmzLoader.cs (2 of 2)
+        shell: python
+        run: |
+          from pathlib import Path
+          root = Path("xbox-cmz-services")
+          root.mkdir(exist_ok=True)
+          with (root / 'CmzLoader.cs').open('a', encoding="utf-8", newline="") as output:
+              output.write(r'''                    while (outer.DeclaringType != null) outer=outer.DeclaringType;
+                              var scope = outer.Scope as AssemblyNameReference;
+                              return new { Reference=reference, Outer=outer, Name=reference.FullName,
+                                  Source=scope == null ? "" : scope.Name };
+                          }).ToArray();
+                          foreach (var item in references) {
+                              bool xna=item.Source.StartsWith("Microsoft.Xna.Framework",StringComparison.Ordinal);
+                              bool bcl=item.Source=="mscorlib" || item.Source=="System" || item.Source=="System.Core";
+                              if (!xna && !bcl) continue;
+                              Type type=RuntimeType(item.Name,xna);
+                              if (type==null) { unresolved.Add(item.Source + " :: " + item.Name); continue; }
+                              var imported=module.ImportReference(type);
+                              item.Outer.Scope=imported.Scope;
+                              item.Reference.Scope=imported.Scope;
+                              mapped++;
+                          }
+                          // Original CF binary is IL-only; target the CLR metadata used by this experimental host.
+                          module.RuntimeVersion = "v4.0.30319";
+                          module.Attributes &= ~ModuleAttributes.Required32Bit;
+                          module.Attributes &= ~ModuleAttributes.Preferred32Bit;
+                          definition.Write(output);
+                          Log("Wrote retargeted app-local copy: " + Path.GetFileName(output));
+                      }
+                  }
+                  private void InspectTypes(string name, Assembly assembly)
+                  {
+                      try {
+                          var types = assembly.GetTypes();
+                          Show(name + ": " + types.Length + " types linked");
+                      } catch (ReflectionTypeLoadException ex) {
+                          int available = ex.Types.Count(t => t != null);
+                          Show(name + ": " + available + "/" + ex.Types.Length + " types linked; missing APIs in log");
+                          foreach (var error in ex.LoaderExceptions.Where(e => e != null)
+                              .Select(e => e.ToString()).Distinct()) Log("TYPE LOAD ERROR " + error);
+                      } catch (Exception ex) {
+                          Show(name + ": type inspection failed " + ex.GetType().Name);
+                          Log(ex.ToString());
+                      }
+                  }
+                  private void InspectSignatures(string name, Assembly assembly) {
+                      Type[] types;
+                      try { types=assembly.GetTypes(); }
+                      catch (ReflectionTypeLoadException ex) { types=ex.Types.Where(t=>t!=null).ToArray(); }
+                      int good=0, bad=0;
+                      var flags=BindingFlags.Public|BindingFlags.NonPublic|BindingFlags.Instance|BindingFlags.Static|BindingFlags.DeclaredOnly;
+                      foreach(var type in types) {
+                          try {
+                              foreach(var field in type.GetFields(flags)) { var fieldType=field.FieldType; good++; }
+                          } catch(Exception ex) { bad++;Log("FIELD SIGNATURE " + type.FullName + " " + Unwrap(ex)); }
+                          MethodBase[] methods;
+                          try { methods=type.GetMethods(flags).Cast<MethodBase>().Concat(type.GetConstructors(flags)).ToArray(); }
+                          catch(Exception ex) { bad++;Log("METHOD ENUMERATION " + type.FullName + " " + Unwrap(ex));continue; }
+                          foreach(var method in methods) {
+                              try {
+                                  foreach(var parameter in method.GetParameters()) { var parameterType=parameter.ParameterType; }
+                                  var info=method as MethodInfo;
+                                  if(info!=null) { var returnType=info.ReturnType; }
+                                  good++;
+                              } catch(Exception ex) { bad++;Log("METHOD SIGNATURE " + type.FullName + "." + method.Name + " " + Unwrap(ex)); }
+                          }
+                      }
+                      Show(name + ": signatures inspected=" + good + "; errors=" + bad + " (no method execution)");
+                  }
+                  private static Exception Unwrap(Exception ex)
+                  {
+                      while (ex is TargetInvocationException && ex.InnerException != null) ex = ex.InnerException;
+                      return ex;
+                  }
+              }
+          }
+          ''')
+      - name: Write LocalServices.cs (1 of 3)
+        shell: python
+        run: |
+          from pathlib import Path
+          root = Path("xbox-cmz-services")
+          root.mkdir(exist_ok=True)
+          with (root / 'LocalServices.cs').open('w', encoding="utf-8", newline="") as output:
+              output.write(r'''// Experimental offline-only XNA services. No Xbox Live, real avatar rendering or game startup.
+          // The local-session tests use synthetic local slots, not detected physical controllers.
+          using System;
+          using System.Collections;
+          using System.Collections.Generic;
+          using System.Collections.ObjectModel;
+          using System.IO;
+          using System.Linq;
+          using System.Threading;
+          using Microsoft.Xna.Framework;
+          using Microsoft.Xna.Framework.GamerServices;
+          using Microsoft.Xna.Framework.Net;
+
+          namespace NexiaCMZLoader {
+              internal static class CompatUnavailable {
+                  internal static Exception Create(string api) {
+                      return new NotSupportedException("CMZ port: not implemented: " + api);
+                  }
+              }
+              internal sealed class CompletedOperation<T> : IAsyncResult {
+                  private static readonly ManualResetEvent Completed = new ManualResetEvent(true);
+                  internal readonly T Value;
+                  internal readonly string Kind;
+                  public object AsyncState { get; private set; }
+                  public WaitHandle AsyncWaitHandle { get { return Completed; } }
+                  public bool CompletedSynchronously { get { return true; } }
+                  public bool IsCompleted { get { return true; } }
+                  internal CompletedOperation(string kind, T value, object state, AsyncCallback callback) {
+                      Kind = kind; Value = value; AsyncState = state;
+                      if (callback != null) callback(this);
+                  }
+                  internal static T End(string kind, IAsyncResult result) {
+                      var operation = result as CompletedOperation<T>;
+                      if (operation == null || operation.Kind != kind) throw new ArgumentException("Wrong asynchronous operation");
+                      return operation.Value;
+                  }
+              }
+              internal static class LocalHost {
+                  internal static string Root;
+                  internal static bool IsAvailable { get { return Root != null; } }
+                  internal static ulong StorageFreeSpace { get { throw CompatUnavailable.Create("StorageDevice.FreeSpace"); } }
+                  internal static ulong StorageTotalSpace { get { throw CompatUnavailable.Create("StorageDevice.TotalSpace"); } }
+                  internal static string ResolveStorageContainer(int slot, string title) {
+                      if (slot < 0 || slot > 3) throw new ArgumentOutOfRangeException("slot");
+                      if (Root == null) throw new InvalidOperationException("Local storage not initialized");
+                      if (string.IsNullOrWhiteSpace(title) || title == "." || title == ".." ||
+                          title.IndexOfAny(new char[]{'/', '\\', ':'}) >= 0 || title.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0)
+                          throw new ArgumentException("Invalid container name", "title");
+                      string path = Path.Combine(Root, "LocalSlots", slot.ToString(), title);
+                      Directory.CreateDirectory(path);
+                      return path;
+                  }
+              }
+              internal static class LocalServiceTests {
+                  private static void Require(bool value, string description) {
+                      if (!value) throw new InvalidOperationException("Local service self-test: " + description);
+                  }
+                  internal static string Run(string folder) {
+                      // Isolate test writes and synthetic profiles from future real player saves.
+                      LocalHost.Root = Path.Combine(folder, "ServiceSelfTest");
+                      Directory.CreateDirectory(LocalHost.Root);
+                      try {
+                          var one = LocalProfiles.Join(PlayerIndex.One);
+                          var two = LocalProfiles.Join(PlayerIndex.Two);
+                          Require(object.ReferenceEquals(one, LocalProfiles.Join(PlayerIndex.One)), "unstable profile identity");
+                          Require(Gamer.SignedInGamers[PlayerIndex.Two] == two, "slot lookup");
+                          one.Tag = "one"; two.Tag = "two";
+                          Require(!object.Equals(one.Tag, two.Tag), "shared player Tag");
+                          var props = new NetworkSessionProperties(); props[0] = 73;
+                          var state = new object(); int callbacks = 0;
+                          var ar = NetworkSession.BeginCreate(NetworkSessionType.Local, new[]{one,two}, 4, 0, props,
+                              x => { Require(object.ReferenceEquals(x.AsyncState, state), "async state"); callbacks++; }, state);
+                          using (var session = NetworkSession.EndCreate(ar)) {
+                              int joined = 0, started = 0, ended = 0;
+                              session.GamerJoined += (s,e) => joined++;
+                              session.GameStarted += (s,e) => started++;
+                              session.GameEnded += (s,e) => ended++;
+                              session.Update();
+                              Require(callbacks == 1 && joined == 2, "create/join events");
+                              Require(session.LocalGamers.Count == 2 && session.AllGamers.Count == 2 && session.RemoteGamers.Count == 0, "membership");
+                              Require(session.SessionProperties[0] == 73, "properties");
+                              var a = session.LocalGamers[0]; var b = session.LocalGamers[1];
+                              var bytes = new byte[]{9,8,7,6};
+                              a.SendData(bytes, 1, 2, SendDataOptions.ReliableInOrder, b);
+                              bytes[1] = 0;
+                              Require(b.IsDataAvailable && !a.IsDataAvailable, "recipient isolation");
+                              NetworkGamer sender; var received = new byte[8];
+                              int n = b.ReceiveData(received, 2, out sender);
+                              Require(n == 2 && received[2] == 8 && received[3] == 7 && sender == a && !b.IsDataAvailable, "copied packet data/sender");
+                              a.IsReady = true; b.IsReady = true; Require(session.IsEveryoneReady, "readiness");
+                              session.StartGame(); session.Update();
+                              Require(session.SessionState == NetworkSessionState.Playing && started == 1, "start event");
+                              session.EndGame(); session.Update();
+                              Require(session.SessionState == NetworkSessionState.Lobby && ended == 1, "end event");
+                          }
+                          string marker0 = "slot0:" + Guid.NewGuid(); string marker1 = "slot1:" + Guid.NewGuid();
+                          for (int i = 0; i < 2; i++) {
+                              var device = Microsoft.Xna.Framework.Storage.StorageDevice.EndShowSelector(
+                                  Microsoft.Xna.Framework.Storage.StorageDevice.BeginShowSelector((PlayerIndex)i, null, null));
+                              using (var container = device.EndOpenContainer(device.BeginOpenContainer("Probe",null,null))) {
+                                  using (var writer = new StreamWriter(container.CreateFile("value.txt"))) writer.Write(i == 0 ? marker0 : marker1);
+                                  bool blocked = false;
+                                  try { container.FileExists("../ProbeSibling/value.txt"); }
+                                  catch (ArgumentException) { blocked = true; }
+                                  Require(blocked, "storage directory escape was not rejected");
+                              }
+                          }
+                          for (int i = 0; i < 2; i++) {
+                              var device = Microsoft.Xna.Framework.Storage.StorageDevice.EndShowSelector(
+                                  Microsoft.Xna.Framework.Storage.StorageDevice.BeginShowSelector((PlayerIndex)i, null, null));
+                              using (var container = device.EndOpenContainer(device.BeginOpenContainer("Probe",null,null)))
+                              using (var reader = new StreamReader(container.OpenFile("value.txt",FileMode.Open,FileAccess.Read)))
+                                  Require(reader.ReadToEnd() == (i == 0 ? marker0 : marker1), "player save isolation");
+                          }
+                          bool unsupported = false;
+                          try { NetworkSession.Create(NetworkSessionType.PlayerMatch,2,4); }
+                          catch (NotSupportedException) { unsupported = true; }
+                          Require(unsupported, "online mode must not pretend to work");
+                          bool avatarBlocked = false;
+                          try { AvatarDescription.CreateRandom(); }
+                          catch (NotSupportedException) { avatarBlocked = true; }
+                          Require(avatarBlocked, "unimplemented avatar API must fail explicitly");
+                          return "synthetic 2-slot session, packet routing, events and separate storage PASS (not controller/gameplay test)";
+                      } finally {
+                          LocalProfiles.Clear();
+                          LocalHost.Root = Path.Combine(folder, "FutureGameStorage");
+                      }
+                  }
+              }
+          }
+
+          namespace Microsoft.Xna.Framework.GamerServices {
+              public class GamerCollection<T> : ReadOnlyCollection<T> {
+                  public GamerCollection() : base(new List<T>()) { }
+                  internal GamerCollection(IList<T> items) : base(items) { }
+                  // The console XNA assembly exposes this concrete nested enumerator.
+                  public new GamerCollectionEnumerator GetEnumerator() { return new GamerCollectionEnumerator(this); }
+                  public struct GamerCollectionEnumerator : IEnumerator<T> {
+                      private readonly IList<T> values; private int index;
+                      internal GamerCollectionEnumerator(IList<T> items) { values=items; index=-1; }
+                      public T Current { get { if(index<0 || index>=values.Count) throw new InvalidOperationException(); return values[index]; } }
+                      object IEnumerator.Current { get { return Current; } }
+                      public bool MoveNext() { if(index<values.Count) index++; return index<values.Count; }
+                      public void Reset() { index=-1; }
+                      public void Dispose() { }
+                  }
+              }
+              public abstract class Gamer : IDisposable {
+                  internal string LocalName;
+                  public string Gamertag { get { return LocalName ?? ""; } }
+                  public string DisplayName { get { return Gamertag; } }
+                  public object Tag { get; set; }
+                  public bool IsDisposed { get; private set; }
+                  public static SignedInGamerCollection SignedInGamers { get { return LocalProfiles.Snapshot(); } }
+                  public override string ToString() { return Gamertag; }
+                  public void Dispose() { IsDisposed=true; }
+                  public GamerProfile GetProfile() { throw NexiaCMZLoader.CompatUnavailable.Create("Gamer.GetProfile"); }
+                  public IAsyncResult BeginGetProfile(AsyncCallback callback,object state) { throw NexiaCMZLoader.CompatUnavailable.Create("Gamer.BeginGetProfile"); }
+                  public GamerProfile EndGetProfile(IAsyncResult result) { throw NexiaCMZLoader.CompatUnavailable.Create("Gamer.EndGetProfile"); }
+              }
+              public sealed class SignedInGamer : Gamer {
+                  public PlayerIndex PlayerIndex { get; internal set; }
+                  public bool IsSignedInToLive { get { return false; } }
+                  public bool IsGuest { get { return true; } }
+                  public GameDefaults GameDefaults { get; private set; }
+                  public GamerPrivileges Privileges { get; private set; }
+                  public static event EventHandler<SignedInEventArgs> SignedIn;
+                  public static event EventHandler<SignedOutEventArgs> SignedOut;
+                  internal SignedInGamer(PlayerIndex slot) {
+                      PlayerIndex=slot; LocalName="Local player " + ((int)slot+1);
+                      GameDefaults=new GameDefaults(); Privileges=new GamerPrivileges();
+                  }
+                  internal static void NotifyIn(SignedInGamer gamer) { if(SignedIn!=null) SignedIn(null,new SignedInEventArgs(gamer)); }
+                  internal static void NotifyOut(SignedInGamer gamer) { if(SignedOut!=null) SignedOut(null,new SignedOutEventArgs(gamer)); }
+                  public FriendCollection GetFriends() { return new FriendCollection(); }
+                  public bool IsHeadset(Microsoft.Xna.Framework.Audio.Microphone microphone) { throw NexiaCMZLoader.CompatUnavailable.Create("IsHeadset"); }
+              }
+              public sealed class SignedInGamerCollection : GamerCollection<SignedInGamer> {
+                  internal SignedInGamerCollection(IList<SignedInGamer> items) : base(items) { }
+                  public SignedInGamer this[PlayerIndex player] { get { return this.FirstOrDefault(x=>x.PlayerIndex==player); } }
+              }
+              public class SignedInEventArgs : EventArgs { public SignedInGamer Gamer { get; private set; } public SignedInEventArgs(SignedInGamer gamer) { Gamer=gamer; } }
+              public class SignedOutEventArgs : EventArgs { public SignedInGamer Gamer { get; private set; } public SignedOutEventArgs(SignedInGamer gamer) { Gamer=gamer; } }
+              internal static class LocalProfiles {
+                  private static readonly SortedDictionary<int,SignedInGamer> Slots = new SortedDictionary<int,SignedInGamer>();
+                  internal static SignedInGamer Join(PlayerIndex index) {
+                      int slot=(int)index; if(slot<0 || slot>3) throw new ArgumentOutOfRangeException("index");
+                      SignedInGamer gamer; if(Slots.TryGetValue(slot,out gamer)) return gamer;
+                      gamer=new SignedInGamer(index); Slots.Add(slot,gamer); SignedInGamer.NotifyIn(gamer); return gamer;
+                  }
+                  internal static SignedInGamerCollection Snapshot() { return new SignedInGamerCollection(Slots.Values.ToList()); }
+                  internal static void Clear() { var old=Slots.Values.ToArray(); Slots.Clear(); foreach(var gamer in old) { SignedInGamer.NotifyOut(gamer); gamer.Dispose(); } }
+              }
+              public sealed class GameDefaults {
+          ''')
+      - name: Write LocalServices.cs (2 of 3)
+        shell: python
+        run: |
+          from pathlib import Path
+          root = Path("xbox-cmz-services")
+          root.mkdir(exist_ok=True)
+          with (root / 'LocalServices.cs').open('a', encoding="utf-8", newline="") as output:
+              output.write(r'''        public bool InvertYAxis { get; set; }
+                  public bool AutoAim { get; set; }
+                  public bool AutoCenter { get; set; }
+                  public bool MoveWithRightThumbStick { get; set; }
+                  public GameDifficulty GameDifficulty { get; set; } = GameDifficulty.Normal;
+                  public ControllerSensitivity ControllerSensitivity { get; set; } = ControllerSensitivity.Medium;
+              }
+              public sealed class GamerPrivileges {
+                  public bool AllowOnlineSessions { get { return false; } }
+                  public bool AllowPurchaseContent { get { return false; } }
+                  public bool AllowTradeContent { get { return false; } }
+                  public bool AllowPremiumContent { get { return false; } }
+                  public GamerPrivilegeSetting AllowCommunication { get { return GamerPrivilegeSetting.Blocked; } }
+                  public GamerPrivilegeSetting AllowProfileViewing { get { return GamerPrivilegeSetting.Blocked; } }
+                  public GamerPrivilegeSetting AllowUserCreatedContent { get { return GamerPrivilegeSetting.Everyone; } }
+              }
+              public sealed class GamerServicesDispatcher {
+                  public static bool IsInitialized { get; private set; }
+                  public static void Initialize(IServiceProvider serviceProvider) { IsInitialized=true; }
+                  public static void Update() { if(!IsInitialized) throw new InvalidOperationException("Local services not initialized"); }
+              }
+              public class GamerServicesComponent : GameComponent {
+                  public GamerServicesComponent(Game game) : base(game) { }
+                  public override void Initialize() { GamerServicesDispatcher.Initialize(Game.Services); base.Initialize(); }
+                  public override void Update(GameTime time) { GamerServicesDispatcher.Update(); base.Update(time); }
+              }
+          }
+
+          namespace Microsoft.Xna.Framework.Net {
+              public class GamerJoinedEventArgs : EventArgs { public NetworkGamer Gamer { get; private set; } public GamerJoinedEventArgs(NetworkGamer gamer) { Gamer=gamer; } }
+              public class GamerLeftEventArgs : EventArgs { public NetworkGamer Gamer { get; private set; } public GamerLeftEventArgs(NetworkGamer gamer) { Gamer=gamer; } }
+              public class GameStartedEventArgs : EventArgs { }
+              public class GameEndedEventArgs : EventArgs { }
+              public class HostChangedEventArgs : EventArgs {
+                  public NetworkGamer OldHost { get; private set; } public NetworkGamer NewHost { get; private set; }
+                  public HostChangedEventArgs(NetworkGamer oldHost,NetworkGamer newHost) { OldHost=oldHost; NewHost=newHost; }
+              }
+              public class NetworkSessionEndedEventArgs : EventArgs {
+                  public NetworkSessionEndReason EndReason { get; private set; }
+                  public NetworkSessionEndedEventArgs(NetworkSessionEndReason reason) { EndReason=reason; }
+              }
+              public sealed class AvailableNetworkSessionCollection : ReadOnlyCollection<AvailableNetworkSession>, IDisposable {
+                  public AvailableNetworkSessionCollection() : base(new List<AvailableNetworkSession>()) { }
+                  public bool IsDisposed { get; private set; }
+                  public void Dispose() { IsDisposed=true; }
+              }
+              public class NetworkSessionProperties : IEnumerable<int?> {
+                  private readonly int?[] values=new int?[8];
+                  public int Count { get { return values.Length; } }
+                  public int? this[int index] { get { return values[index]; } set { values[index]=value; } }
+                  public IEnumerator<int?> GetEnumerator() { return ((IEnumerable<int?>)values).GetEnumerator(); }
+                  IEnumerator IEnumerable.GetEnumerator() { return GetEnumerator(); }
+                  internal NetworkSessionProperties Copy() { var p=new NetworkSessionProperties(); Array.Copy(values,p.values,8); return p; }
+              }
+              public class NetworkGamer : Gamer {
+                  public NetworkSession Session { get; internal set; }
+                  public NetworkMachine Machine { get; internal set; }
+                  public bool IsHost { get; internal set; }
+                  public bool IsLocal { get { return true; } }
+                  public bool IsReady { get; set; }
+                  public bool IsPrivateSlot { get; internal set; }
+                  public bool HasLeftSession { get; internal set; }
+                  public byte Id { get; internal set; }
+                  public bool IsGuest { get { return true; } }
+                  public bool HasVoice { get { return false; } }
+                  public bool IsTalking { get { return false; } }
+                  public bool IsMutedByLocalUser { get { return false; } }
+                  public TimeSpan RoundtripTime { get { return TimeSpan.Zero; } }
+              }
+              internal sealed class LocalPacket { internal NetworkGamer Sender; internal byte[] Data; }
+              public sealed class LocalNetworkGamer : NetworkGamer {
+                  public SignedInGamer SignedInGamer { get; internal set; }
+                  internal readonly Queue<LocalPacket> Inbox=new Queue<LocalPacket>();
+                  internal int QueuedBytes;
+                  public bool IsDataAvailable { get { lock(Session.Sync) return Inbox.Count>0; } }
+                  public void SendData(byte[] data, SendDataOptions options) { SendData(data,0,data==null?0:data.Length,options,null); }
+                  public void SendData(byte[] data, SendDataOptions options, NetworkGamer recipient) { SendData(data,0,data==null?0:data.Length,options,recipient); }
+                  public void SendData(byte[] data,int offset,int count,SendDataOptions options) { SendData(data,offset,count,options,null); }
+                  public void SendData(byte[] data,int offset,int count,SendDataOptions options,NetworkGamer recipient) {
+                      Session.Deliver(this,data,offset,count,options,recipient);
+                  }
+                  public int ReceiveData(byte[] data,out NetworkGamer sender) { return ReceiveData(data,0,out sender); }
+                  public int ReceiveData(byte[] data,int offset,out NetworkGamer sender) {
+                      if(data==null) throw new ArgumentNullException("data");
+                      lock(Session.Sync) {
+                          Session.EnsureOpen();
+                          if(offset<0 || offset>data.Length) throw new ArgumentOutOfRangeException("offset");
+                          if(Inbox.Count==0) throw new InvalidOperationException("No packet is available");
+                          var packet=Inbox.Peek();
+                          if(packet.Data.Length>data.Length-offset) throw new ArgumentException("Buffer is too small");
+                          Inbox.Dequeue(); QueuedBytes-=packet.Data.Length; sender=packet.Sender;
+                          Array.Copy(packet.Data,0,data,offset,packet.Data.Length); return packet.Data.Length;
+                      }
+                  }
+                  public void SendData(PacketWriter data,SendDataOptions options) { SendData(data.ToArray(),options); }
+                  public void SendData(PacketWriter data,SendDataOptions options,NetworkGamer recipient) { SendData(data.ToArray(),options,recipient); }
+                  public int ReceiveData(PacketReader data,out NetworkGamer sender) { var bytes=new byte[65536]; int n=ReceiveData(bytes,out sender);data.SetPacket(bytes,n);return n; }
+              }
+              public sealed class NetworkMachine {
+                  internal NetworkSession Owner;
+                  public GamerCollection<NetworkGamer> Gamers { get { return Owner.AllGamers; } }
+                  public void RemoveFromSession() { Owner.Dispose(); }
+              }
+              public sealed class NetworkSession : IDisposable {
+                  internal readonly object Sync=new object();
+                  private readonly List<LocalNetworkGamer> locals=new List<LocalNetworkGamer>();
+                  private readonly Queue<Action> events=new Queue<Action>();
+                  private NetworkMachine machine;
+                  public static int MaxSupportedGamers=4;
+                  public static int MaxPreviousGamers=4;
+                  public bool IsDisposed { get; private set; }
+                  public NetworkSessionType SessionType { get { return NetworkSessionType.Local; } }
+                  public NetworkSessionState SessionState { get; private set; }
+                  public bool IsHost { get { return !IsDisposed; } }
+                  public NetworkGamer Host { get { return locals.FirstOrDefault(); } }
+                  public int MaxGamers { get; private set; }
+                  public int PrivateGamerSlots { get; private set; }
+                  public bool AllowHostMigration { get; set; }
+                  public bool AllowJoinInProgress { get; set; }
+                  public NetworkSessionProperties SessionProperties { get; private set; }
+                  public GamerCollection<LocalNetworkGamer> LocalGamers { get { lock(Sync) return new GamerCollection<LocalNetworkGamer>(locals.ToList()); } }
+                  public GamerCollection<NetworkGamer> AllGamers { get { lock(Sync) return new GamerCollection<NetworkGamer>(locals.Cast<NetworkGamer>().ToList()); } }
+                  public GamerCollection<NetworkGamer> RemoteGamers { get { return new GamerCollection<NetworkGamer>(); } }
+                  public bool IsEveryoneReady { get { lock(Sync) return locals.Count>0 && locals.All(g=>g.IsReady); } }
+                  public int BytesPerSecondSent { get { throw NexiaCMZLoader.CompatUnavailable.Create("network bandwidth metric"); } }
+                  public int BytesPerSecondReceived { get { throw NexiaCMZLoader.CompatUnavailable.Create("network bandwidth metric"); } }
+                  public event EventHandler<GamerJoinedEventArgs> GamerJoined;
+                  public event EventHandler<GamerLeftEventArgs> GamerLeft;
+                  public event EventHandler<GameStartedEventArgs> GameStarted;
+                  public event EventHandler<GameEndedEventArgs> GameEnded;
+                  public event EventHandler<HostChangedEventArgs> HostChanged;
+                  public event EventHandler<NetworkSessionEndedEventArgs> SessionEnded;
+                  public static event EventHandler<InviteAcceptedEventArgs> InviteAccepted;
+                  private NetworkSession() { }
+                  internal void EnsureOpen() { if(IsDisposed) throw new ObjectDisposedException("NetworkSession"); }
+                  public static NetworkSession Create(NetworkSessionType type,int maxLocalGamers,int maxGamers) { return Create(type,maxLocalGamers,maxGamers,0,null); }
+                  public static NetworkSession Create(NetworkSessionType type,int maxLocalGamers,int maxGamers,int privateSlots,NetworkSessionProperties properties) {
+                      if(maxLocalGamers<1 || maxLocalGamers>4) throw new ArgumentOutOfRangeException("maxLocalGamers");
+                      return Create(type,Gamer.SignedInGamers.Take(maxLocalGamers),maxGamers,privateSlots,properties);
+                  }
+                  public static NetworkSession Create(NetworkSessionType type,IEnumerable<SignedInGamer> players,int maxGamers,int privateSlots,NetworkSessionProperties properties) {
+                      if(type!=NetworkSessionType.Local) throw NexiaCMZLoader.CompatUnavailable.Create("non-local session " + type);
+                      if(players==null) throw new ArgumentNullException("players");
+                      var list=players.ToList();
+                      if(maxGamers<1 || maxGamers>4 || list.Count<1 || list.Count>maxGamers || list.Any(x=>x==null || x.IsDisposed) || list.Select(x=>x.PlayerIndex).Distinct().Count()!=list.Count)
+                          throw new ArgumentException("Expected 1-4 distinct valid local players");
+                      if(privateSlots<0 || privateSlots>maxGamers) throw new ArgumentOutOfRangeException("privateSlots");
+                      var session=new NetworkSession { MaxGamers=maxGamers, PrivateGamerSlots=privateSlots, SessionProperties=(properties??new NetworkSessionProperties()).Copy() };
+                      session.machine=new NetworkMachine { Owner=session };
+                      foreach(var player in list) session.AddLocalGamer(player);
+                      return session;
+                  }
+                  public static IAsyncResult BeginCreate(NetworkSessionType type,IEnumerable<SignedInGamer> players,int maxGamers,int privateSlots,NetworkSessionProperties properties,AsyncCallback callback,object state) {
+                      return new NexiaCMZLoader.CompletedOperation<NetworkSession>("Create",Create(type,players,maxGamers,privateSlots,properties),state,callback);
+                  }
+                  public static IAsyncResult BeginCreate(NetworkSessionType type,int maxLocalGamers,int maxGamers,AsyncCallback callback,object state) {
+                      return BeginCreate(type,maxLocalGamers,maxGamers,0,null,callback,state);
+                  }
+                  public static IAsyncResult BeginCreate(NetworkSessionType type,int maxLocalGamers,int maxGamers,int privateSlots,NetworkSessionProperties properties,AsyncCallback callback,object state) {
+                      return new NexiaCMZLoader.CompletedOperation<NetworkSession>("Create",Create(type,maxLocalGamers,maxGamers,privateSlots,properties),state,callback);
+                  }
+                  public static NetworkSession EndCreate(IAsyncResult result) { return NexiaCMZLoader.CompletedOperation<NetworkSession>.End("Create",result); }
+                  public static IAsyncResult BeginFind(NetworkSessionType type,IEnumerable<SignedInGamer> players,NetworkSessionProperties properties,AsyncCallback callback,object state) { throw NexiaCMZLoader.CompatUnavailable.Create("NetworkSession.BeginFind"); }
+                  public static AvailableNetworkSessionCollection EndFind(IAsyncResult result) { throw NexiaCMZLoader.CompatUnavailable.Create("NetworkSession.EndFind"); }
+                  public static IAsyncResult BeginJoin(AvailableNetworkSession session,AsyncCallback callback,object state) { throw NexiaCMZLoader.CompatUnavailable.Create("NetworkSession.BeginJoin"); }
+          ''')
+      - name: Write LocalServices.cs (3 of 3)
+        shell: python
+        run: |
+          from pathlib import Path
+          root = Path("xbox-cmz-services")
+          root.mkdir(exist_ok=True)
+          with (root / 'LocalServices.cs').open('a', encoding="utf-8", newline="") as output:
+              output.write(r'''        public static NetworkSession EndJoin(IAsyncResult result) { throw NexiaCMZLoader.CompatUnavailable.Create("NetworkSession.EndJoin"); }
+                  public static IAsyncResult BeginJoinInvited(IEnumerable<SignedInGamer> players,AsyncCallback callback,object state) { throw NexiaCMZLoader.CompatUnavailable.Create("NetworkSession.BeginJoinInvited"); }
+                  public static NetworkSession EndJoinInvited(IAsyncResult result) { throw NexiaCMZLoader.CompatUnavailable.Create("NetworkSession.EndJoinInvited"); }
+                  public void AddLocalGamer(SignedInGamer gamer) {
+                      if(gamer==null || gamer.IsDisposed) throw new ArgumentException("Invalid local gamer");
+                      lock(Sync) {
+                          EnsureOpen();
+                          if(locals.Count>=MaxGamers || locals.Any(g=>g.SignedInGamer.PlayerIndex==gamer.PlayerIndex)) throw new InvalidOperationException("Slot unavailable");
+                          if(SessionState==NetworkSessionState.Playing && !AllowJoinInProgress) throw new InvalidOperationException("Join in progress disabled");
+                          var local=new LocalNetworkGamer { Session=this, Machine=machine, SignedInGamer=gamer, Id=(byte)locals.Count, IsHost=locals.Count==0, LocalName=gamer.Gamertag };
+                          locals.Add(local); events.Enqueue(()=>{ if(GamerJoined!=null) GamerJoined(this,new GamerJoinedEventArgs(local)); });
+                      }
+                  }
+                  public NetworkGamer FindGamerById(byte id) { lock(Sync) return locals.FirstOrDefault(g=>g.Id==id); }
+                  public void Update() {
+                      Action[] pending; lock(Sync) { EnsureOpen(); pending=events.ToArray(); events.Clear(); }
+                      foreach(var action in pending) action();
+                  }
+                  public void StartGame() {
+                      lock(Sync) { EnsureOpen(); if(SessionState!=NetworkSessionState.Lobby) throw new InvalidOperationException("Not in lobby");
+                          SessionState=NetworkSessionState.Playing; events.Enqueue(()=>{if(GameStarted!=null)GameStarted(this,new GameStartedEventArgs());}); }
+                  }
+                  public void EndGame() {
+                      lock(Sync) { EnsureOpen(); if(SessionState!=NetworkSessionState.Playing) throw new InvalidOperationException("Not playing");
+                          SessionState=NetworkSessionState.Lobby; events.Enqueue(()=>{if(GameEnded!=null)GameEnded(this,new GameEndedEventArgs());}); }
+                  }
+                  public void ResetReady() { lock(Sync) { EnsureOpen(); foreach(var gamer in locals) gamer.IsReady=false; } }
+                  internal void Deliver(LocalNetworkGamer sender,byte[] bytes,int offset,int count,SendDataOptions options,NetworkGamer recipient) {
+                      if(bytes==null) throw new ArgumentNullException("bytes");
+                      if(offset<0 || count<0 || offset>bytes.Length-count || count>65536) throw new ArgumentOutOfRangeException("count");
+                      if(options<SendDataOptions.None || options>SendDataOptions.ReliableInOrder) throw NexiaCMZLoader.CompatUnavailable.Create("voice/chat packets");
+                      lock(Sync) {
+                          EnsureOpen();
+                          if(sender.Session!=this || sender.HasLeftSession) throw new ArgumentException("Invalid sender");
+                          if(recipient!=null && (recipient.Session!=this || recipient.HasLeftSession || !(recipient is LocalNetworkGamer))) throw new ArgumentException("Invalid recipient");
+                          // Provisional local model: broadcast includes other locals; explicit self-send is supported.
+                          var targets=recipient==null?locals.Where(g=>g!=sender).ToArray():new[]{(LocalNetworkGamer)recipient};
+                          foreach(var target in targets) if(target.Inbox.Count>=256 || target.QueuedBytes+count>4194304) throw new InvalidOperationException("Local packet queue is full");
+                          foreach(var target in targets) { var copy=new byte[count]; Array.Copy(bytes,offset,copy,0,count);target.Inbox.Enqueue(new LocalPacket { Sender=sender, Data=copy });target.QueuedBytes+=count; }
+                      }
+                  }
+                  public void Dispose() {
+                      lock(Sync) { if(IsDisposed)return; IsDisposed=true;SessionState=NetworkSessionState.Ended;events.Clear();
+                          foreach(var gamer in locals) { gamer.HasLeftSession=true;gamer.Inbox.Clear();gamer.QueuedBytes=0;gamer.Dispose(); } }
+                      if(SessionEnded!=null)SessionEnded(this,new NetworkSessionEndedEventArgs(NetworkSessionEndReason.HostEndedSession));
+                  }
+              }
+              public class PacketWriter : BinaryWriter {
+                  public PacketWriter() : this(256) { }
+                  public PacketWriter(int capacity) : base(new MemoryStream(capacity)) { }
+                  public int Length { get { return checked((int)BaseStream.Length); } }
+                  public int Position { get { return checked((int)BaseStream.Position); } set { BaseStream.Position=value; } }
+                  internal byte[] ToArray() { Flush(); return ((MemoryStream)BaseStream).ToArray(); }
+                  public void Write(Vector2 v) { Write(v.X);Write(v.Y); }
+                  public void Write(Vector3 v) { Write(v.X);Write(v.Y);Write(v.Z); }
+                  public void Write(Vector4 v) { Write(v.X);Write(v.Y);Write(v.Z);Write(v.W); }
+                  public void Write(Quaternion v) { Write(v.X);Write(v.Y);Write(v.Z);Write(v.W); }
+                  public void Write(Color v) { Write(v.PackedValue); }
+                  public void Write(Matrix m) { Write(m.M11);Write(m.M12);Write(m.M13);Write(m.M14);Write(m.M21);Write(m.M22);Write(m.M23);Write(m.M24);Write(m.M31);Write(m.M32);Write(m.M33);Write(m.M34);Write(m.M41);Write(m.M42);Write(m.M43);Write(m.M44); }
+              }
+              public class PacketReader : BinaryReader {
+                  public PacketReader() : this(256) { }
+                  public PacketReader(int capacity) : base(new MemoryStream(capacity)) { }
+                  public int Length { get { return checked((int)BaseStream.Length); } }
+                  public int Position { get { return checked((int)BaseStream.Position); } set { BaseStream.Position=value; } }
+                  internal void SetPacket(byte[] bytes,int count) { BaseStream.SetLength(0);BaseStream.Write(bytes,0,count);BaseStream.Position=0; }
+                  public Vector2 ReadVector2() { return new Vector2(ReadSingle(),ReadSingle()); }
+                  public Vector3 ReadVector3() { return new Vector3(ReadSingle(),ReadSingle(),ReadSingle()); }
+                  public Vector4 ReadVector4() { return new Vector4(ReadSingle(),ReadSingle(),ReadSingle(),ReadSingle()); }
+                  public Quaternion ReadQuaternion() { return new Quaternion(ReadSingle(),ReadSingle(),ReadSingle(),ReadSingle()); }
+                  public Color ReadColor() { return new Color { PackedValue=ReadUInt32() }; }
+                  public Matrix ReadMatrix() { return new Matrix(ReadSingle(),ReadSingle(),ReadSingle(),ReadSingle(),ReadSingle(),ReadSingle(),ReadSingle(),ReadSingle(),ReadSingle(),ReadSingle(),ReadSingle(),ReadSingle(),ReadSingle(),ReadSingle(),ReadSingle(),ReadSingle()); }
+              }
+          }
+
+          namespace Microsoft.Xna.Framework.GamerServices {
+              public static class Guide {
+                  public static bool IsVisible { get { return false; } }
+                  public static bool IsTrialMode { get { throw NexiaCMZLoader.CompatUnavailable.Create("Guide.IsTrialMode license integration"); } }
+                  public static NotificationPosition NotificationPosition { get; set; }
+                  public static void ShowSignIn(int paneCount,bool onlineOnly) { throw NexiaCMZLoader.CompatUnavailable.Create("Guide.ShowSignIn UI"); }
+                  public static void ShowMarketplace(PlayerIndex player) { throw NexiaCMZLoader.CompatUnavailable.Create("Guide.ShowMarketplace"); }
+                  public static void ShowGameInvite(PlayerIndex player,IEnumerable<Gamer> gamers) { throw NexiaCMZLoader.CompatUnavailable.Create("Guide.ShowGameInvite"); }
+                  public static IAsyncResult BeginShowMessageBox(string title,string text,IEnumerable<string> buttons,int focus,MessageBoxIcon icon,AsyncCallback callback,object state) { throw NexiaCMZLoader.CompatUnavailable.Create("Guide.BeginShowMessageBox UI"); }
+                  public static IAsyncResult BeginShowMessageBox(PlayerIndex player,string title,string text,IEnumerable<string> buttons,int focus,MessageBoxIcon icon,AsyncCallback callback,object state) { throw NexiaCMZLoader.CompatUnavailable.Create("Guide.BeginShowMessageBox UI"); }
+                  public static int? EndShowMessageBox(IAsyncResult result) { throw NexiaCMZLoader.CompatUnavailable.Create("Guide.EndShowMessageBox UI"); }
+                  public static IAsyncResult BeginShowKeyboardInput(PlayerIndex player,string title,string description,string defaultText,AsyncCallback callback,object state) { throw NexiaCMZLoader.CompatUnavailable.Create("Guide.BeginShowKeyboardInput UI"); }
+                  public static string EndShowKeyboardInput(IAsyncResult result) { throw NexiaCMZLoader.CompatUnavailable.Create("Guide.EndShowKeyboardInput UI"); }
+              }
+          }
+          namespace Microsoft.Xna.Framework.Media {
+              public sealed class VisualizationData {
+                  public ReadOnlyCollection<float> Samples { get { throw NexiaCMZLoader.CompatUnavailable.Create("VisualizationData.Samples"); } }
+                  public ReadOnlyCollection<float> Frequencies { get { throw NexiaCMZLoader.CompatUnavailable.Create("VisualizationData.Frequencies"); } }
+              }
+          }
+          ''')
+      - name: Write LocalStorage.cs (1 of 1)
+        shell: python
+        run: |
+          from pathlib import Path
+          root = Path("xbox-cmz-services")
+          root.mkdir(exist_ok=True)
+          with (root / 'LocalStorage.cs').open('w', encoding="utf-8", newline="") as output:
+              output.write(r'''using System;
+          using System.IO;
+          using System.Threading;
+          using NexiaCMZLoader;
+          // Generated by stubgen from the console's own XNA assemblies.
+          // Signatures are real; behaviour is not. Do not edit by hand.
+          #pragma warning disable CS0067, CS0649, CS0108, CS0114, CS0628
+
+          namespace Microsoft.Xna.Framework.Storage {
+            public partial class StorageContainer : global::System.Object {
+            }
+            public sealed partial class StorageDevice : global::System.Object {
+              public static event global::System.EventHandler<global::System.EventArgs> DeviceChanged { add { } remove { } }
+            }
+            public partial class StorageDeviceNotConnectedException : global::System.Runtime.InteropServices.ExternalException {
+            }
+          }
+
+          // Storage, answered by Nexia rather than borrowed from MonoGame.
+          //
+          // MonoGame's StorageDevice saves to a desktop folder of its own choosing. On a
+          // console the save belongs to a profile and the system decides where it lives,
+          // so this asks Nexia (LocalHost.ResolveStorageContainer) and works inside whatever
+          // directory it hands back. Everything below that is ordinary System.IO: a
+          // StorageContainer IS a directory of files, and the title only ever sees
+          // streams.
+          //
+          // Signatures come from the console's own MXF.Storage.dlx - see Stubs.cs for
+          // the members not implemented here, and Stubs.skip for the ones that are.
+
+
+
+
+
+          namespace Microsoft.Xna.Framework.Storage {
+            // XNA's Begin/End pattern, completed before Begin even returns. There is
+            // nothing to wait for: resolving a directory is not slow, and a title that
+            // polls IsCompleted or blocks on AsyncWaitHandle sees a finished operation
+            // either way.
+            internal sealed class SyncAsyncResult : IAsyncResult, IDisposable {
+              private ManualResetEvent handle;
+
+              internal SyncAsyncResult(object result, object state) {
+                Result = result;
+                AsyncState = state;
+              }
+
+              internal object Result { get; }
+              public object AsyncState { get; }
+              public bool CompletedSynchronously => true;
+              public bool IsCompleted => true;
+
+              public WaitHandle AsyncWaitHandle {
+                get {
+                  // Only allocated if someone actually waits, which most titles never do.
+                  if (handle == null) {
+                    Interlocked.CompareExchange(ref handle, new ManualResetEvent(true), null);
+                  }
+                  return handle;
+                }
+              }
+
+              internal SyncAsyncResult Complete(AsyncCallback callback) {
+                callback?.Invoke(this);
+                return this;
+              }
+
+              public void Dispose() => handle?.Dispose();
+            }
+
+            public sealed partial class StorageDevice {
+              // Which profile's storage this device represents. XNA lets a title ask
+              // without naming a player, which on a console means "the signed-in one" -
+              // slot 0 is the honest reading of that.
+              internal int Slot;
+
+              internal StorageDevice(int slot) { Slot = slot; }
+
+              public long FreeSpace =>
+                  LocalHost.IsAvailable ? (long)Math.Min(LocalHost.StorageFreeSpace, long.MaxValue) : 0;
+
+              public long TotalSpace =>
+                  LocalHost.IsAvailable ? (long)Math.Min(LocalHost.StorageTotalSpace, long.MaxValue) : 0;
+
+              // The hard drive is not removable, so it is connected whenever Nexia is
+              // there to answer at all.
+              public bool IsConnected => LocalHost.IsAvailable;
+
+              public static IAsyncResult BeginShowSelector(AsyncCallback callback, object state) =>
+                  BeginShowSelector(PlayerIndex.One, callback, state);
+
+              public static IAsyncResult BeginShowSelector(int sizeInBytes, int directoryCount,
+                                                           AsyncCallback callback, object state) =>
+                  BeginShowSelector(PlayerIndex.One, callback, state);
+
+              public static IAsyncResult BeginShowSelector(PlayerIndex player, int sizeInBytes,
+                                                           int directoryCount,
+                                                           AsyncCallback callback, object state) =>
+                  BeginShowSelector(player, callback, state);
+
+              // There is exactly one device, so there is nothing to select between and no
+              // reason to put a picker in front of the user.
+              public static IAsyncResult BeginShowSelector(PlayerIndex player,
+                                                           AsyncCallback callback, object state) =>
+                  new SyncAsyncResult(new StorageDevice((int)player), state).Complete(callback);
+
+              public static StorageDevice EndShowSelector(IAsyncResult result) =>
+                  (result as SyncAsyncResult)?.Result as StorageDevice;
+
+              public IAsyncResult BeginOpenContainer(string displayName, AsyncCallback callback,
+                                                     object state) =>
+                  new SyncAsyncResult(new StorageContainer(this, displayName), state)
+                      .Complete(callback);
+
+              public StorageContainer EndOpenContainer(IAsyncResult result) =>
+                  (result as SyncAsyncResult)?.Result as StorageContainer;
+
+              public void DeleteContainer(string titleName) {
+                string root = LocalHost.IsAvailable
+                    ? LocalHost.ResolveStorageContainer(Slot, titleName) : null;
+                if (root == null) return;
+                try {
+                  Directory.Delete(root, true);
+                } catch (DirectoryNotFoundException) {
+                  // Deleting a container that was never created is not an error.
+                }
+              }
+            }
+
+            public partial class StorageContainer : IDisposable {
+              private readonly string root;
+
+              internal StorageContainer(StorageDevice device, string displayName) {
+                StorageDevice = device;
+                DisplayName = displayName;
+                root = LocalHost.IsAvailable
+                    ? LocalHost.ResolveStorageContainer(device.Slot, displayName) : null;
+              }
+
+              public string DisplayName { get; }
+              public StorageDevice StorageDevice { get; }
+              public bool IsDisposed { get; private set; }
+
+              // Field-like, not generated: a stubbed event has empty add/remove and
+              // throws away every handler the title attaches.
+              public event EventHandler<EventArgs> Disposing;
+
+              // Every path a title gives is relative to its container, and must stay
+              // inside it: "../../someone else" is not a filename.
+              private string Resolve(string relative) {
+                if (root == null) {
+                  throw new StorageDeviceNotConnectedException(
+                      "Nexia is not providing storage.");
+                }
+                if (IsDisposed) throw new ObjectDisposedException("StorageContainer");
+                if (relative != null && Path.IsPathRooted(relative)) throw new ArgumentException("Absolute paths are not allowed");
+                string full = Path.GetFullPath(Path.Combine(root, relative ?? string.Empty));
+                string prefix = Path.GetFullPath(root).TrimEnd(Path.DirectorySeparatorChar,Path.AltDirectorySeparatorChar);
+                if (!string.Equals(full,prefix,StringComparison.OrdinalIgnoreCase) &&
+                    !full.StartsWith(prefix + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)) {
+                  throw new ArgumentException("path leaves the container", nameof(relative));
+                }
+                return full;
+              }
+
+              private void EnsureParent(string full) {
+                string directory = Path.GetDirectoryName(full);
+                if (!string.IsNullOrEmpty(directory)) Directory.CreateDirectory(directory);
+              }
+
+              public bool DirectoryExists(string directory) => Directory.Exists(Resolve(directory));
+              public bool FileExists(string file) => File.Exists(Resolve(file));
+
+              public void CreateDirectory(string directory) => Directory.CreateDirectory(Resolve(directory));
+              public void DeleteDirectory(string directory) => Directory.Delete(Resolve(directory), true);
+              public void DeleteFile(string file) => File.Delete(Resolve(file));
+
+              public Stream CreateFile(string file) {
+                string full = Resolve(file);
+                EnsureParent(full);
+                return File.Create(full);
+              }
+
+              public Stream OpenFile(string file, FileMode fileMode) =>
+                  OpenFile(file, fileMode, FileAccess.ReadWrite, FileShare.None);
+
+              public Stream OpenFile(string file, FileMode fileMode, FileAccess fileAccess) =>
+                  OpenFile(file, fileMode, fileAccess, FileShare.None);
+
+              public Stream OpenFile(string file, FileMode fileMode, FileAccess fileAccess,
+                                     FileShare fileShare) {
+                string full = Resolve(file);
+                // A mode that can create the file has to be able to create the directory
+                // holding it too, or a title that saves into a subfolder it never
+                // explicitly made fails on a fresh profile.
+                if (fileMode != FileMode.Open && fileMode != FileMode.Truncate) {
+                  EnsureParent(full);
+                }
+                return new FileStream(full, fileMode, fileAccess, fileShare);
+              }
+
+              public string[] GetDirectoryNames() => GetDirectoryNames("*");
+
+              public string[] GetDirectoryNames(string searchPattern) =>
+                  Names(Directory.Exists(Resolve(string.Empty))
+                            ? Directory.GetDirectories(Resolve(string.Empty), searchPattern ?? "*")
+                            : Array.Empty<string>());
+
+              public string[] GetFileNames() => GetFileNames("*");
+
+              public string[] GetFileNames(string searchPattern) =>
+                  Names(Directory.Exists(Resolve(string.Empty))
+                            ? Directory.GetFiles(Resolve(string.Empty), searchPattern ?? "*")
+                            : Array.Empty<string>());
+
+              // XNA hands back names, not paths - a title passes what it gets straight
+              // back to OpenFile.
+              private static string[] Names(string[] paths) {
+                var names = new string[paths.Length];
+                for (int i = 0; i < paths.Length; i++) names[i] = Path.GetFileName(paths[i]);
+                return names;
+              }
+
+              public void Dispose() {
+                if (IsDisposed) return;
+                IsDisposed = true;
+                Disposing?.Invoke(this, EventArgs.Empty);
+              }
+            }
+
+            public partial class StorageDeviceNotConnectedException {
+              public StorageDeviceNotConnectedException() { }
+              public StorageDeviceNotConnectedException(string message) : base(message) { }
+              public StorageDeviceNotConnectedException(string message, Exception innerException)
+                  : base(message, innerException) { }
+            }
+          }
+          ''')
+      - name: Write NexiaGuardedSignatures.cs (1 of 4)
+        shell: python
+        run: |
+          from pathlib import Path
+          root = Path("xbox-cmz-services")
+          root.mkdir(exist_ok=True)
+          with (root / 'NexiaGuardedSignatures.cs').open('w', encoding="utf-8", newline="") as output:
+              output.write(r'''// Adapted from Nexia's generated XNA signatures (BSD license in NEXIA-LICENSE.txt).
+          // UNIMPLEMENTED APIs explicitly throw; these declarations are NOT working Xbox Live/avatar services.
+          // Offline definitions with real state/queues are in LocalServices.cs.
+          #pragma warning disable CS0067, CS0649, CS0108, CS0114, CS0628
+          namespace Microsoft.Xna.Framework.GamerServices {
+            public sealed partial class Achievement : global::System.Object {
+              public global::System.String Key { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.Achievement.Key"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.Achievement.Key"); } }
+              public global::System.String Name { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.Achievement.Name"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.Achievement.Name"); } }
+              public global::System.String Description { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.Achievement.Description"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.Achievement.Description"); } }
+              public global::System.String HowToEarn { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.Achievement.HowToEarn"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.Achievement.HowToEarn"); } }
+              public global::System.Int32 GamerScore { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.Achievement.GamerScore"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.Achievement.GamerScore"); } }
+              public global::System.Boolean IsEarned { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.Achievement.IsEarned"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.Achievement.IsEarned"); } }
+              public global::System.Boolean EarnedOnline { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.Achievement.EarnedOnline"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.Achievement.EarnedOnline"); } }
+              public global::System.Boolean DisplayBeforeEarned { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.Achievement.DisplayBeforeEarned"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.Achievement.DisplayBeforeEarned"); } }
+              public global::System.DateTime EarnedDateTime { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.Achievement.EarnedDateTime"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.Achievement.EarnedDateTime"); } }
+              public global::System.IO.Stream GetPicture() => throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.Achievement.GetPicture");
+            }
+            public sealed partial class AchievementCollection : global::System.Object {
+              public global::System.Boolean IsDisposed { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.AchievementCollection.IsDisposed"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.AchievementCollection.IsDisposed"); } }
+              public global::System.Int32 Count { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.AchievementCollection.Count"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.AchievementCollection.Count"); } }
+              public void Dispose() { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.AchievementCollection.Dispose"); }
+              public global::System.Collections.Generic.IEnumerator<global::Microsoft.Xna.Framework.GamerServices.Achievement> GetEnumerator() => throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.AchievementCollection.GetEnumerator");
+            }
+            public enum ControllerSensitivity : int {
+              Low = 0,
+              Medium = 1,
+              High = 2,
+            }
+            public sealed partial class FriendCollection : global::Microsoft.Xna.Framework.GamerServices.GamerCollection<global::Microsoft.Xna.Framework.GamerServices.FriendGamer> {
+              public global::System.Boolean IsDisposed { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.FriendCollection.IsDisposed"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.FriendCollection.IsDisposed"); } }
+              public void Dispose() { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.FriendCollection.Dispose"); }
+            }
+            public sealed partial class FriendGamer : global::Microsoft.Xna.Framework.GamerServices.Gamer {
+              public global::System.String Presence { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.FriendGamer.Presence"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.FriendGamer.Presence"); } }
+              public global::System.Boolean IsOnline { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.FriendGamer.IsOnline"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.FriendGamer.IsOnline"); } }
+              public global::System.Boolean IsPlaying { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.FriendGamer.IsPlaying"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.FriendGamer.IsPlaying"); } }
+              public global::System.Boolean IsJoinable { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.FriendGamer.IsJoinable"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.FriendGamer.IsJoinable"); } }
+              public global::System.Boolean IsAway { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.FriendGamer.IsAway"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.FriendGamer.IsAway"); } }
+              public global::System.Boolean IsBusy { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.FriendGamer.IsBusy"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.FriendGamer.IsBusy"); } }
+              public global::System.Boolean HasVoice { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.FriendGamer.HasVoice"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.FriendGamer.HasVoice"); } }
+              public global::System.Boolean FriendRequestReceivedFrom { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.FriendGamer.FriendRequestReceivedFrom"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.FriendGamer.FriendRequestReceivedFrom"); } }
+              public global::System.Boolean FriendRequestSentTo { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.FriendGamer.FriendRequestSentTo"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.FriendGamer.FriendRequestSentTo"); } }
+              public global::System.Boolean InviteReceivedFrom { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.FriendGamer.InviteReceivedFrom"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.FriendGamer.InviteReceivedFrom"); } }
+              public global::System.Boolean InviteSentTo { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.FriendGamer.InviteSentTo"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.FriendGamer.InviteSentTo"); } }
+              public global::System.Boolean InviteAccepted { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.FriendGamer.InviteAccepted"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.FriendGamer.InviteAccepted"); } }
+              public global::System.Boolean InviteRejected { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.FriendGamer.InviteRejected"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.FriendGamer.InviteRejected"); } }
+            }
+            public enum GameDifficulty : int {
+              Easy = 0,
+              Normal = 1,
+              Hard = 2,
+            }
+            public sealed partial class GamerPresence : global::System.Object {
+              public global::Microsoft.Xna.Framework.GamerServices.GamerPresenceMode PresenceMode { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.GamerPresence.PresenceMode"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.GamerPresence.PresenceMode"); } }
+              public global::System.Int32 PresenceValue { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.GamerPresence.PresenceValue"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.GamerPresence.PresenceValue"); } }
+            }
+            public enum GamerPresenceMode : int {
+              None = 0,
+              SinglePlayer = 1,
+              Multiplayer = 2,
+              LocalCoOp = 3,
+              LocalVersus = 4,
+              OnlineCoOp = 5,
+              OnlineVersus = 6,
+              VersusComputer = 7,
+              Stage = 8,
+              Level = 9,
+              CoOpStage = 10,
+              CoOpLevel = 11,
+              ArcadeMode = 12,
+              CampaignMode = 13,
+              ChallengeMode = 14,
+              ExplorationMode = 15,
+              PracticeMode = 16,
+              PuzzleMode = 17,
+              ScenarioMode = 18,
+              StoryMode = 19,
+              SurvivalMode = 20,
+              TutorialMode = 21,
+              DifficultyEasy = 22,
+              DifficultyMedium = 23,
+              DifficultyHard = 24,
+              DifficultyExtreme = 25,
+              Score = 26,
+              VersusScore = 27,
+              Winning = 28,
+              Losing = 29,
+              ScoreIsTied = 30,
+              Outnumbered = 31,
+              OnARoll = 32,
+              InCombat = 33,
+              BattlingBoss = 34,
+              TimeAttack = 35,
+              TryingForRecord = 36,
+              FreePlay = 37,
+              WastingTime = 38,
+              StuckOnAHardBit = 39,
+              NearlyFinished = 40,
+              LookingForGames = 41,
+              WaitingForPlayers = 42,
+              WaitingInLobby = 43,
+              SettingUpMatch = 44,
+              PlayingWithFriends = 45,
+              AtMenu = 46,
+              StartingGame = 47,
+              Paused = 48,
+              GameOver = 49,
+              WonTheGame = 50,
+              ConfiguringSettings = 51,
+              CustomizingPlayer = 52,
+              EditingLevel = 53,
+              InGameStore = 54,
+              WatchingCutscene = 55,
+              WatchingCredits = 56,
+              PlayingMinigame = 57,
+              FoundSecret = 58,
+              CornflowerBlue = 59,
+            }
+            public partial class GamerPrivilegeException : global::System.Exception {
+              public GamerPrivilegeException() { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.GamerPrivilegeException.GamerPrivilegeException"); }
+              public GamerPrivilegeException(global::System.String message) { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.GamerPrivilegeException.GamerPrivilegeException"); }
+              public GamerPrivilegeException(global::System.String message, global::System.Exception innerException) { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.GamerPrivilegeException.GamerPrivilegeException"); }
+            }
+            public enum GamerPrivilegeSetting : int {
+              Blocked = 0,
+              FriendsOnly = 1,
+              Everyone = 2,
+            }
+            public sealed partial class GamerProfile : global::System.Object {
+              public global::System.Boolean IsDisposed { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.GamerProfile.IsDisposed"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.GamerProfile.IsDisposed"); } }
+              public global::System.String Motto { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.GamerProfile.Motto"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.GamerProfile.Motto"); } }
+              public global::System.Single Reputation { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.GamerProfile.Reputation"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.GamerProfile.Reputation"); } }
+              public global::Microsoft.Xna.Framework.GamerServices.GamerZone GamerZone { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.GamerProfile.GamerZone"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.GamerProfile.GamerZone"); } }
+              public global::System.Globalization.RegionInfo Region { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.GamerProfile.Region"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.GamerProfile.Region"); } }
+              public global::System.Int32 GamerScore { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.GamerProfile.GamerScore"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.GamerProfile.GamerScore"); } }
+              public global::System.Int32 TitlesPlayed { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.GamerProfile.TitlesPlayed"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.GamerProfile.TitlesPlayed"); } }
+          ''')
+      - name: Write NexiaGuardedSignatures.cs (2 of 4)
+        shell: python
+        run: |
+          from pathlib import Path
+          root = Path("xbox-cmz-services")
+          root.mkdir(exist_ok=True)
+          with (root / 'NexiaGuardedSignatures.cs').open('a', encoding="utf-8", newline="") as output:
+              output.write(r'''    public global::System.Int32 TotalAchievements { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.GamerProfile.TotalAchievements"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.GamerProfile.TotalAchievements"); } }
+              public void Dispose() { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.GamerProfile.Dispose"); }
+              public global::System.IO.Stream GetGamerPicture() => throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.GamerProfile.GetGamerPicture");
+            }
+            public partial class GamerServicesNotAvailableException : global::System.Exception {
+              public GamerServicesNotAvailableException() { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.GamerServicesNotAvailableException.GamerServicesNotAvailableException"); }
+              public GamerServicesNotAvailableException(global::System.String message) { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.GamerServicesNotAvailableException.GamerServicesNotAvailableException"); }
+              public GamerServicesNotAvailableException(global::System.String message, global::System.Exception innerException) { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.GamerServicesNotAvailableException.GamerServicesNotAvailableException"); }
+            }
+            public enum GamerZone : int {
+              Unknown = 0,
+              Recreation = 1,
+              Pro = 2,
+              Family = 3,
+              Underground = 4,
+            }
+            public partial class GameUpdateRequiredException : global::System.Exception {
+              public GameUpdateRequiredException() { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.GameUpdateRequiredException.GameUpdateRequiredException"); }
+              public GameUpdateRequiredException(global::System.String message) { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.GameUpdateRequiredException.GameUpdateRequiredException"); }
+              public GameUpdateRequiredException(global::System.String message, global::System.Exception innerException) { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.GameUpdateRequiredException.GameUpdateRequiredException"); }
+            }
+            public partial class GuideAlreadyVisibleException : global::System.Exception {
+              public GuideAlreadyVisibleException() { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.GuideAlreadyVisibleException.GuideAlreadyVisibleException"); }
+              public GuideAlreadyVisibleException(global::System.String message) { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.GuideAlreadyVisibleException.GuideAlreadyVisibleException"); }
+              public GuideAlreadyVisibleException(global::System.String message, global::System.Exception innerException) { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.GuideAlreadyVisibleException.GuideAlreadyVisibleException"); }
+            }
+            public partial class InviteAcceptedEventArgs : global::System.EventArgs {
+              public global::System.Boolean IsCurrentSession { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.InviteAcceptedEventArgs.IsCurrentSession"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.InviteAcceptedEventArgs.IsCurrentSession"); } }
+              public global::Microsoft.Xna.Framework.GamerServices.SignedInGamer Gamer { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.InviteAcceptedEventArgs.Gamer"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.InviteAcceptedEventArgs.Gamer"); } }
+              public InviteAcceptedEventArgs(global::Microsoft.Xna.Framework.GamerServices.SignedInGamer gamer, global::System.Boolean isCurrentSession) { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.InviteAcceptedEventArgs.InviteAcceptedEventArgs"); }
+            }
+            public sealed partial class LeaderboardEntry : global::System.Object {
+              public global::Microsoft.Xna.Framework.GamerServices.Gamer Gamer { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.LeaderboardEntry.Gamer"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.LeaderboardEntry.Gamer"); } }
+              public global::System.Int64 Rating { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.LeaderboardEntry.Rating"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.LeaderboardEntry.Rating"); } }
+              public global::Microsoft.Xna.Framework.GamerServices.PropertyDictionary Columns { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.LeaderboardEntry.Columns"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.LeaderboardEntry.Columns"); } }
+            }
+            public partial struct LeaderboardIdentity {
+              public global::System.String Key { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.LeaderboardIdentity.Key"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.LeaderboardIdentity.Key"); } }
+              public global::System.Int32 GameMode { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.LeaderboardIdentity.GameMode"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.LeaderboardIdentity.GameMode"); } }
+              public static global::Microsoft.Xna.Framework.GamerServices.LeaderboardIdentity Create(global::Microsoft.Xna.Framework.GamerServices.LeaderboardKey key, global::System.Int32 gameMode) => throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.LeaderboardIdentity.Create");
+              public static global::Microsoft.Xna.Framework.GamerServices.LeaderboardIdentity Create(global::Microsoft.Xna.Framework.GamerServices.LeaderboardKey key) => throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.LeaderboardIdentity.Create");
+            }
+            public enum LeaderboardKey : int {
+              BestScoreLifeTime = 0,
+              BestScoreRecent = 1,
+              BestTimeLifeTime = 2,
+              BestTimeRecent = 3,
+            }
+            public enum LeaderboardOutcome : int {
+              None = 0,
+              Win = 1,
+              Loss = 2,
+              Tie = 3,
+            }
+            public sealed partial class LeaderboardReader : global::System.Object {
+              public global::Microsoft.Xna.Framework.GamerServices.LeaderboardIdentity LeaderboardIdentity { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.LeaderboardReader.LeaderboardIdentity"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.LeaderboardReader.LeaderboardIdentity"); } }
+              public global::System.Int32 TotalLeaderboardSize { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.LeaderboardReader.TotalLeaderboardSize"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.LeaderboardReader.TotalLeaderboardSize"); } }
+              public global::System.Int32 PageStart { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.LeaderboardReader.PageStart"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.LeaderboardReader.PageStart"); } }
+              public global::System.Collections.ObjectModel.ReadOnlyCollection<global::Microsoft.Xna.Framework.GamerServices.LeaderboardEntry> Entries { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.LeaderboardReader.Entries"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.LeaderboardReader.Entries"); } }
+              public global::System.Boolean IsDisposed { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.LeaderboardReader.IsDisposed"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.LeaderboardReader.IsDisposed"); } }
+              public global::System.Boolean CanPageUp { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.LeaderboardReader.CanPageUp"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.LeaderboardReader.CanPageUp"); } }
+              public global::System.Boolean CanPageDown { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.LeaderboardReader.CanPageDown"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.LeaderboardReader.CanPageDown"); } }
+              public static global::Microsoft.Xna.Framework.GamerServices.LeaderboardReader Read(global::Microsoft.Xna.Framework.GamerServices.LeaderboardIdentity leaderboardId, global::System.Collections.Generic.IEnumerable<global::Microsoft.Xna.Framework.GamerServices.Gamer> gamers, global::Microsoft.Xna.Framework.GamerServices.Gamer pivotGamer, global::System.Int32 pageSize) => throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.LeaderboardReader.Read");
+              public static global::Microsoft.Xna.Framework.GamerServices.LeaderboardReader Read(global::Microsoft.Xna.Framework.GamerServices.LeaderboardIdentity leaderboardId, global::Microsoft.Xna.Framework.GamerServices.Gamer pivotGamer, global::System.Int32 pageSize) => throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.LeaderboardReader.Read");
+              public static global::Microsoft.Xna.Framework.GamerServices.LeaderboardReader Read(global::Microsoft.Xna.Framework.GamerServices.LeaderboardIdentity leaderboardId, global::System.Int32 pageStart, global::System.Int32 pageSize) => throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.LeaderboardReader.Read");
+              public static global::System.IAsyncResult BeginRead(global::Microsoft.Xna.Framework.GamerServices.LeaderboardIdentity leaderboardId, global::System.Collections.Generic.IEnumerable<global::Microsoft.Xna.Framework.GamerServices.Gamer> gamers, global::Microsoft.Xna.Framework.GamerServices.Gamer pivotGamer, global::System.Int32 pageSize, global::System.AsyncCallback callback, global::System.Object asyncState) => throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.LeaderboardReader.BeginRead");
+              public static global::System.IAsyncResult BeginRead(global::Microsoft.Xna.Framework.GamerServices.LeaderboardIdentity leaderboardId, global::Microsoft.Xna.Framework.GamerServices.Gamer pivotGamer, global::System.Int32 pageSize, global::System.AsyncCallback callback, global::System.Object asyncState) => throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.LeaderboardReader.BeginRead");
+              public static global::System.IAsyncResult BeginRead(global::Microsoft.Xna.Framework.GamerServices.LeaderboardIdentity leaderboardId, global::System.Int32 pageStart, global::System.Int32 pageSize, global::System.AsyncCallback callback, global::System.Object asyncState) => throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.LeaderboardReader.BeginRead");
+              public static global::Microsoft.Xna.Framework.GamerServices.LeaderboardReader EndRead(global::System.IAsyncResult result) => throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.LeaderboardReader.EndRead");
+              public void Dispose() { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.LeaderboardReader.Dispose"); }
+              public void PageUp() { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.LeaderboardReader.PageUp"); }
+              public void PageDown() { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.LeaderboardReader.PageDown"); }
+              public global::System.IAsyncResult BeginPageUp(global::System.AsyncCallback callback, global::System.Object asyncState) => throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.LeaderboardReader.BeginPageUp");
+              public global::System.IAsyncResult BeginPageDown(global::System.AsyncCallback callback, global::System.Object asyncState) => throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.LeaderboardReader.BeginPageDown");
+              public void EndPageUp(global::System.IAsyncResult result) { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.LeaderboardReader.EndPageUp"); }
+              public void EndPageDown(global::System.IAsyncResult result) { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.LeaderboardReader.EndPageDown"); }
+            }
+            public sealed partial class LeaderboardWriter : global::System.Object {
+              public LeaderboardWriter() { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.LeaderboardWriter.LeaderboardWriter"); }
+              public global::Microsoft.Xna.Framework.GamerServices.LeaderboardEntry GetLeaderboard(global::Microsoft.Xna.Framework.GamerServices.LeaderboardIdentity leaderboardId) => throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.LeaderboardWriter.GetLeaderboard");
+            }
+            public enum MessageBoxIcon : int {
+              None = 0,
+              Error = 1,
+              Warning = 2,
+              Alert = 3,
+            }
+            public partial class NetworkException : global::System.Exception {
+              public NetworkException() { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.NetworkException.NetworkException"); }
+          ''')
+      - name: Write NexiaGuardedSignatures.cs (3 of 4)
+        shell: python
+        run: |
+          from pathlib import Path
+          root = Path("xbox-cmz-services")
+          root.mkdir(exist_ok=True)
+          with (root / 'NexiaGuardedSignatures.cs').open('a', encoding="utf-8", newline="") as output:
+              output.write(r'''    public NetworkException(global::System.String message) { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.NetworkException.NetworkException"); }
+              public NetworkException(global::System.String message, global::System.Exception innerException) { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.NetworkException.NetworkException"); }
+            }
+            public partial class NetworkNotAvailableException : global::Microsoft.Xna.Framework.GamerServices.NetworkException {
+              public NetworkNotAvailableException() { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.NetworkNotAvailableException.NetworkNotAvailableException"); }
+              public NetworkNotAvailableException(global::System.String message) { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.NetworkNotAvailableException.NetworkNotAvailableException"); }
+              public NetworkNotAvailableException(global::System.String message, global::System.Exception innerException) { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.NetworkNotAvailableException.NetworkNotAvailableException"); }
+            }
+            public enum NotificationPosition : int {
+              TopLeft = 0,
+              TopCenter = 1,
+              TopRight = 2,
+              CenterLeft = 3,
+              Center = 4,
+              CenterRight = 5,
+              BottomLeft = 6,
+              BottomCenter = 7,
+              BottomRight = 8,
+            }
+            public sealed partial class PropertyDictionary : global::System.Object {
+              public global::System.Int32 Count { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.PropertyDictionary.Count"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.PropertyDictionary.Count"); } }
+              public global::System.Int32 GetValueInt32(global::System.String key) => throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.PropertyDictionary.GetValueInt32");
+              public global::System.Int64 GetValueInt64(global::System.String key) => throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.PropertyDictionary.GetValueInt64");
+              public global::System.Single GetValueSingle(global::System.String key) => throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.PropertyDictionary.GetValueSingle");
+              public global::System.Double GetValueDouble(global::System.String key) => throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.PropertyDictionary.GetValueDouble");
+              public global::System.String GetValueString(global::System.String key) => throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.PropertyDictionary.GetValueString");
+              public global::Microsoft.Xna.Framework.GamerServices.LeaderboardOutcome GetValueOutcome(global::System.String key) => throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.PropertyDictionary.GetValueOutcome");
+              public global::System.DateTime GetValueDateTime(global::System.String key) => throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.PropertyDictionary.GetValueDateTime");
+              public global::System.TimeSpan GetValueTimeSpan(global::System.String key) => throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.PropertyDictionary.GetValueTimeSpan");
+              public global::System.IO.Stream GetValueStream(global::System.String key) => throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.PropertyDictionary.GetValueStream");
+              public void SetValue(global::System.String key, global::System.Int32 @value) { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.PropertyDictionary.SetValue"); }
+              public void SetValue(global::System.String key, global::System.Int64 @value) { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.PropertyDictionary.SetValue"); }
+              public void SetValue(global::System.String key, global::System.Single @value) { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.PropertyDictionary.SetValue"); }
+              public void SetValue(global::System.String key, global::System.Double @value) { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.PropertyDictionary.SetValue"); }
+              public void SetValue(global::System.String key, global::System.String @value) { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.PropertyDictionary.SetValue"); }
+              public void SetValue(global::System.String key, global::Microsoft.Xna.Framework.GamerServices.LeaderboardOutcome @value) { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.PropertyDictionary.SetValue"); }
+              public void SetValue(global::System.String key, global::System.DateTime @value) { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.PropertyDictionary.SetValue"); }
+              public void SetValue(global::System.String key, global::System.TimeSpan @value) { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.PropertyDictionary.SetValue"); }
+              public global::System.Boolean ContainsKey(global::System.String key) => throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.PropertyDictionary.ContainsKey");
+              public global::System.Boolean TryGetValue(global::System.String key, out global::System.Object @value) { throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.PropertyDictionary.TryGetValue"); }
+              public global::System.Collections.Generic.IEnumerator<global::System.Collections.Generic.KeyValuePair<global::System.String, global::System.Object>> GetEnumerator() => throw global::NexiaCMZLoader.CompatUnavailable.Create("GamerServices.PropertyDictionary.GetEnumerator");
+            }
+            public enum RacingCameraAngle : int {
+              Back = 0,
+              Front = 1,
+              Inside = 2,
+            }
+          }
+          namespace Microsoft.Xna.Framework.Net {
+            public sealed partial class AvailableNetworkSession : global::System.Object {
+              public global::System.String HostGamertag { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("Net.AvailableNetworkSession.HostGamertag"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("Net.AvailableNetworkSession.HostGamertag"); } }
+              public global::System.Int32 CurrentGamerCount { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("Net.AvailableNetworkSession.CurrentGamerCount"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("Net.AvailableNetworkSession.CurrentGamerCount"); } }
+              public global::System.Int32 OpenPublicGamerSlots { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("Net.AvailableNetworkSession.OpenPublicGamerSlots"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("Net.AvailableNetworkSession.OpenPublicGamerSlots"); } }
+              public global::System.Int32 OpenPrivateGamerSlots { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("Net.AvailableNetworkSession.OpenPrivateGamerSlots"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("Net.AvailableNetworkSession.OpenPrivateGamerSlots"); } }
+              public global::Microsoft.Xna.Framework.Net.NetworkSessionProperties SessionProperties { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("Net.AvailableNetworkSession.SessionProperties"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("Net.AvailableNetworkSession.SessionProperties"); } }
+              public global::Microsoft.Xna.Framework.Net.QualityOfService QualityOfService { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("Net.AvailableNetworkSession.QualityOfService"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("Net.AvailableNetworkSession.QualityOfService"); } }
+            }
+            public enum NetworkSessionEndReason : int {
+              ClientSignedOut = 0,
+              HostEndedSession = 1,
+              RemovedByHost = 2,
+              Disconnected = 3,
+            }
+            public enum NetworkSessionJoinError : int {
+              SessionNotFound = 0,
+              SessionNotJoinable = 1,
+              SessionFull = 2,
+            }
+            public partial class NetworkSessionJoinException : global::Microsoft.Xna.Framework.GamerServices.NetworkException {
+              public global::Microsoft.Xna.Framework.Net.NetworkSessionJoinError JoinError { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("Net.NetworkSessionJoinException.JoinError"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("Net.NetworkSessionJoinException.JoinError"); } }
+              public NetworkSessionJoinException() { throw global::NexiaCMZLoader.CompatUnavailable.Create("Net.NetworkSessionJoinException.NetworkSessionJoinException"); }
+              public NetworkSessionJoinException(global::System.String message) { throw global::NexiaCMZLoader.CompatUnavailable.Create("Net.NetworkSessionJoinException.NetworkSessionJoinException"); }
+              public NetworkSessionJoinException(global::System.String message, global::Microsoft.Xna.Framework.Net.NetworkSessionJoinError joinError) { throw global::NexiaCMZLoader.CompatUnavailable.Create("Net.NetworkSessionJoinException.NetworkSessionJoinException"); }
+              public NetworkSessionJoinException(global::System.String message, global::System.Exception innerException) { throw global::NexiaCMZLoader.CompatUnavailable.Create("Net.NetworkSessionJoinException.NetworkSessionJoinException"); }
+            }
+            public enum NetworkSessionState : int {
+              Lobby = 0,
+              Playing = 1,
+              Ended = 2,
+            }
+            public enum NetworkSessionType : int {
+              Local = 0,
+              SystemLink = 1,
+              PlayerMatch = 2,
+              Ranked = 3,
+              LocalWithLeaderboards = 4,
+            }
+            public sealed partial class QualityOfService : global::System.Object {
+              public global::System.Boolean IsAvailable { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("Net.QualityOfService.IsAvailable"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("Net.QualityOfService.IsAvailable"); } }
+              public global::System.Int32 BytesPerSecondUpstream { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("Net.QualityOfService.BytesPerSecondUpstream"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("Net.QualityOfService.BytesPerSecondUpstream"); } }
+              public global::System.Int32 BytesPerSecondDownstream { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("Net.QualityOfService.BytesPerSecondDownstream"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("Net.QualityOfService.BytesPerSecondDownstream"); } }
+              public global::System.TimeSpan AverageRoundtripTime { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("Net.QualityOfService.AverageRoundtripTime"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("Net.QualityOfService.AverageRoundtripTime"); } }
+              public global::System.TimeSpan MinimumRoundtripTime { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("Net.QualityOfService.MinimumRoundtripTime"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("Net.QualityOfService.MinimumRoundtripTime"); } }
+            }
+            public enum SendDataOptions : int {
+              None = 0,
+              Reliable = 1,
+              InOrder = 2,
+              ReliableInOrder = 3,
+              Chat = 4,
+            }
+            public sealed partial class WriteLeaderboardsEventArgs : global::System.EventArgs {
+              public global::Microsoft.Xna.Framework.Net.NetworkGamer Gamer { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("Net.WriteLeaderboardsEventArgs.Gamer"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("Net.WriteLeaderboardsEventArgs.Gamer"); } }
+              public global::System.Boolean IsLeaving { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("Net.WriteLeaderboardsEventArgs.IsLeaving"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("Net.WriteLeaderboardsEventArgs.IsLeaving"); } }
+            }
+          }
+          namespace Microsoft.Xna.Framework.GamerServices {
+            public partial class AvatarAnimation : global::System.Object {
+              public global::System.TimeSpan Length { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("Avatar.AvatarAnimation.Length"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("Avatar.AvatarAnimation.Length"); } }
+              public global::System.TimeSpan CurrentPosition { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("Avatar.AvatarAnimation.CurrentPosition"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("Avatar.AvatarAnimation.CurrentPosition"); } }
+              public global::System.Collections.ObjectModel.ReadOnlyCollection<global::Microsoft.Xna.Framework.Matrix> BoneTransforms { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("Avatar.AvatarAnimation.BoneTransforms"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("Avatar.AvatarAnimation.BoneTransforms"); } }
+              public global::Microsoft.Xna.Framework.GamerServices.AvatarExpression Expression { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("Avatar.AvatarAnimation.Expression"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("Avatar.AvatarAnimation.Expression"); } }
+          ''')
+      - name: Write NexiaGuardedSignatures.cs (4 of 4)
+        shell: python
+        run: |
+          from pathlib import Path
+          root = Path("xbox-cmz-services")
+          root.mkdir(exist_ok=True)
+          with (root / 'NexiaGuardedSignatures.cs').open('a', encoding="utf-8", newline="") as output:
+              output.write(r'''    public global::System.Boolean IsDisposed { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("Avatar.AvatarAnimation.IsDisposed"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("Avatar.AvatarAnimation.IsDisposed"); } }
+              public AvatarAnimation(global::Microsoft.Xna.Framework.GamerServices.AvatarAnimationPreset animationPreset) { throw global::NexiaCMZLoader.CompatUnavailable.Create("Avatar.AvatarAnimation.AvatarAnimation"); }
+              public void Update(global::System.TimeSpan elapsedAnimationTime, global::System.Boolean loop) { throw global::NexiaCMZLoader.CompatUnavailable.Create("Avatar.AvatarAnimation.Update"); }
+              public void Dispose() { throw global::NexiaCMZLoader.CompatUnavailable.Create("Avatar.AvatarAnimation.Dispose"); }
+              protected virtual void Dispose(global::System.Boolean disposing) { throw global::NexiaCMZLoader.CompatUnavailable.Create("Avatar.AvatarAnimation.Dispose"); }
+            }
+            public enum AvatarAnimationPreset : int {
+              Stand0 = 0,
+              Stand1 = 1,
+              Stand2 = 2,
+              Stand3 = 3,
+              Stand4 = 4,
+              Stand5 = 5,
+              Stand6 = 6,
+              Stand7 = 7,
+              Clap = 8,
+              Wave = 9,
+              Celebrate = 10,
+              FemaleIdleCheckNails = 11,
+              FemaleIdleLookAround = 12,
+              FemaleIdleShiftWeight = 13,
+              FemaleIdleFixShoe = 14,
+              FemaleAngry = 15,
+              FemaleConfused = 16,
+              FemaleLaugh = 17,
+              FemaleCry = 18,
+              FemaleShocked = 19,
+              FemaleYawn = 20,
+              MaleIdleLookAround = 21,
+              MaleIdleStretch = 22,
+              MaleIdleShiftWeight = 23,
+              MaleIdleCheckHand = 24,
+              MaleAngry = 25,
+              MaleConfused = 26,
+              MaleLaugh = 27,
+              MaleCry = 28,
+              MaleSurprised = 29,
+              MaleYawn = 30,
+            }
+            public enum AvatarBodyType : int {
+              Female = 0,
+              Male = 1,
+            }
+            public enum AvatarBone : int {
+              Root = 0,
+              BackLower = 1,
+              HipLeft = 2,
+              HipRight = 3,
+              BackUpper = 5,
+              KneeLeft = 6,
+              KneeRight = 8,
+              AnkleLeft = 11,
+              CollarLeft = 12,
+              Neck = 14,
+              AnkleRight = 15,
+              CollarRight = 16,
+              Head = 19,
+              ShoulderLeft = 20,
+              ToeLeft = 21,
+              ShoulderRight = 22,
+              ToeRight = 23,
+              ElbowLeft = 25,
+              ElbowRight = 28,
+              WristLeft = 33,
+              WristRight = 36,
+              FingerIndexLeft = 37,
+              FingerMiddleLeft = 38,
+              FingerRingLeft = 39,
+              FingerSmallLeft = 40,
+              PropLeft = 41,
+              SpecialLeft = 42,
+              FingerThumbLeft = 43,
+              FingerIndexRight = 44,
+              FingerMiddleRight = 45,
+              FingerRingRight = 46,
+              FingerSmallRight = 47,
+              PropRight = 48,
+              SpecialRight = 49,
+              FingerThumbRight = 50,
+              FingerIndex2Left = 51,
+              FingerMiddle2Left = 52,
+              FingerRing2Left = 53,
+              FingerSmall2Left = 54,
+              FingerThumb2Left = 55,
+              FingerIndex2Right = 56,
+              FingerMiddle2Right = 57,
+              FingerRing2Right = 58,
+              FingerSmall2Right = 59,
+              FingerThumb2Right = 60,
+              FingerIndex3Left = 61,
+              FingerMiddle3Left = 62,
+              FingerRing3Left = 63,
+              FingerSmall3Left = 64,
+              FingerThumb3Left = 65,
+              FingerIndex3Right = 66,
+              FingerMiddle3Right = 67,
+              FingerRing3Right = 68,
+              FingerSmall3Right = 69,
+              FingerThumb3Right = 70,
+            }
+            public partial class AvatarDescription : global::System.Object {
+              public global::System.Boolean IsValid { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("Avatar.AvatarDescription.IsValid"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("Avatar.AvatarDescription.IsValid"); } }
+              public global::System.Byte[] Description { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("Avatar.AvatarDescription.Description"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("Avatar.AvatarDescription.Description"); } }
+              public global::System.Single Height { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("Avatar.AvatarDescription.Height"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("Avatar.AvatarDescription.Height"); } }
+              public global::Microsoft.Xna.Framework.GamerServices.AvatarBodyType BodyType { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("Avatar.AvatarDescription.BodyType"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("Avatar.AvatarDescription.BodyType"); } }
+              public event global::System.EventHandler<global::System.EventArgs> Changed { add { throw global::NexiaCMZLoader.CompatUnavailable.Create("Avatar.AvatarDescription.Changed"); } remove { throw global::NexiaCMZLoader.CompatUnavailable.Create("Avatar.AvatarDescription.Changed"); } }
+              public AvatarDescription(global::System.Byte[] data) { throw global::NexiaCMZLoader.CompatUnavailable.Create("Avatar.AvatarDescription.AvatarDescription"); }
+              public static global::System.IAsyncResult BeginGetFromGamer(global::Microsoft.Xna.Framework.GamerServices.Gamer gamer, global::System.AsyncCallback callback, global::System.Object state) => throw global::NexiaCMZLoader.CompatUnavailable.Create("Avatar.AvatarDescription.BeginGetFromGamer");
+              public static global::Microsoft.Xna.Framework.GamerServices.AvatarDescription EndGetFromGamer(global::System.IAsyncResult result) => throw global::NexiaCMZLoader.CompatUnavailable.Create("Avatar.AvatarDescription.EndGetFromGamer");
+              public static global::Microsoft.Xna.Framework.GamerServices.AvatarDescription CreateRandom() => throw global::NexiaCMZLoader.CompatUnavailable.Create("Avatar.AvatarDescription.CreateRandom");
+              public static global::Microsoft.Xna.Framework.GamerServices.AvatarDescription CreateRandom(global::Microsoft.Xna.Framework.GamerServices.AvatarBodyType bodyType) => throw global::NexiaCMZLoader.CompatUnavailable.Create("Avatar.AvatarDescription.CreateRandom");
+            }
+            public partial struct AvatarExpression {
+              public global::Microsoft.Xna.Framework.GamerServices.AvatarMouth Mouth { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("Avatar.AvatarExpression.Mouth"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("Avatar.AvatarExpression.Mouth"); } }
+              public global::Microsoft.Xna.Framework.GamerServices.AvatarEye LeftEye { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("Avatar.AvatarExpression.LeftEye"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("Avatar.AvatarExpression.LeftEye"); } }
+              public global::Microsoft.Xna.Framework.GamerServices.AvatarEye RightEye { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("Avatar.AvatarExpression.RightEye"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("Avatar.AvatarExpression.RightEye"); } }
+              public global::Microsoft.Xna.Framework.GamerServices.AvatarEyebrow LeftEyebrow { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("Avatar.AvatarExpression.LeftEyebrow"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("Avatar.AvatarExpression.LeftEyebrow"); } }
+              public global::Microsoft.Xna.Framework.GamerServices.AvatarEyebrow RightEyebrow { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("Avatar.AvatarExpression.RightEyebrow"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("Avatar.AvatarExpression.RightEyebrow"); } }
+            }
+            public enum AvatarEye : int {
+              Neutral = 0,
+              Sad = 1,
+              Angry = 2,
+              Confused = 3,
+              Laughing = 4,
+              Shocked = 5,
+              Happy = 6,
+              Yawning = 7,
+              Sleeping = 8,
+              LookUp = 9,
+              LookDown = 10,
+              LookLeft = 11,
+              LookRight = 12,
+              Blink = 13,
+            }
+            public enum AvatarEyebrow : int {
+              Neutral = 0,
+              Sad = 1,
+              Angry = 2,
+              Confused = 3,
+              Raised = 4,
+            }
+            public enum AvatarMouth : int {
+              Neutral = 0,
+              Sad = 1,
+              Angry = 2,
+              Confused = 3,
+              Laughing = 4,
+              Shocked = 5,
+              Happy = 6,
+              PhoneticO = 7,
+              PhoneticAi = 8,
+              PhoneticEe = 9,
+              PhoneticFv = 10,
+              PhoneticW = 11,
+              PhoneticL = 12,
+              PhoneticDth = 13,
+            }
+            public partial class AvatarRenderer : global::System.Object {
+              public static global::System.Int32 BoneCount;
+              public global::Microsoft.Xna.Framework.Matrix World { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("Avatar.AvatarRenderer.World"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("Avatar.AvatarRenderer.World"); } }
+              public global::Microsoft.Xna.Framework.Matrix View { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("Avatar.AvatarRenderer.View"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("Avatar.AvatarRenderer.View"); } }
+              public global::Microsoft.Xna.Framework.Matrix Projection { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("Avatar.AvatarRenderer.Projection"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("Avatar.AvatarRenderer.Projection"); } }
+              public global::System.Collections.ObjectModel.ReadOnlyCollection<global::System.Int32> ParentBones { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("Avatar.AvatarRenderer.ParentBones"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("Avatar.AvatarRenderer.ParentBones"); } }
+              public global::System.Collections.ObjectModel.ReadOnlyCollection<global::Microsoft.Xna.Framework.Matrix> BindPose { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("Avatar.AvatarRenderer.BindPose"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("Avatar.AvatarRenderer.BindPose"); } }
+              public global::Microsoft.Xna.Framework.GamerServices.AvatarRendererState State { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("Avatar.AvatarRenderer.State"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("Avatar.AvatarRenderer.State"); } }
+              public global::Microsoft.Xna.Framework.Vector3 LightColor { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("Avatar.AvatarRenderer.LightColor"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("Avatar.AvatarRenderer.LightColor"); } }
+              public global::Microsoft.Xna.Framework.Vector3 LightDirection { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("Avatar.AvatarRenderer.LightDirection"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("Avatar.AvatarRenderer.LightDirection"); } }
+              public global::Microsoft.Xna.Framework.Vector3 AmbientLightColor { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("Avatar.AvatarRenderer.AmbientLightColor"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("Avatar.AvatarRenderer.AmbientLightColor"); } }
+              public global::System.Boolean IsDisposed { get { throw global::NexiaCMZLoader.CompatUnavailable.Create("Avatar.AvatarRenderer.IsDisposed"); } set { throw global::NexiaCMZLoader.CompatUnavailable.Create("Avatar.AvatarRenderer.IsDisposed"); } }
+              public AvatarRenderer(global::Microsoft.Xna.Framework.GamerServices.AvatarDescription avatarDescription) { throw global::NexiaCMZLoader.CompatUnavailable.Create("Avatar.AvatarRenderer.AvatarRenderer"); }
+              public AvatarRenderer(global::Microsoft.Xna.Framework.GamerServices.AvatarDescription avatarDescription, global::System.Boolean useLoadingEffect) { throw global::NexiaCMZLoader.CompatUnavailable.Create("Avatar.AvatarRenderer.AvatarRenderer"); }
+              public void Draw(global::Microsoft.Xna.Framework.GamerServices.IAvatarAnimation animation) { throw global::NexiaCMZLoader.CompatUnavailable.Create("Avatar.AvatarRenderer.Draw"); }
+              public void Draw(global::System.Collections.Generic.IList<global::Microsoft.Xna.Framework.Matrix> bones, global::Microsoft.Xna.Framework.GamerServices.AvatarExpression expression) { throw global::NexiaCMZLoader.CompatUnavailable.Create("Avatar.AvatarRenderer.Draw"); }
+              public void Dispose() { throw global::NexiaCMZLoader.CompatUnavailable.Create("Avatar.AvatarRenderer.Dispose"); }
+              protected virtual void Dispose(global::System.Boolean disposing) { throw global::NexiaCMZLoader.CompatUnavailable.Create("Avatar.AvatarRenderer.Dispose"); }
+            }
+            public enum AvatarRendererState : int {
+              Loading = 0,
+              Ready = 1,
+              Unavailable = 2,
+            }
+            public partial interface IAvatarAnimation {
+              public global::System.Collections.ObjectModel.ReadOnlyCollection<global::Microsoft.Xna.Framework.Matrix> BoneTransforms { get; set; }
+              public global::System.TimeSpan CurrentPosition { get; set; }
+              public global::System.TimeSpan Length { get; set; }
+              public global::Microsoft.Xna.Framework.GamerServices.AvatarExpression Expression { get; set; }
+              void Update(global::System.TimeSpan elapsedAnimationTime, global::System.Boolean loop);
+            }
+          }
+          ''')
+      - name: Write ManagedProbe.csproj (1 of 1)
+        shell: python
+        run: |
+          from pathlib import Path
+          root = Path("xbox-cmz-services")
+          root.mkdir(exist_ok=True)
+          with (root / 'ManagedProbe.csproj').open('w', encoding="utf-8", newline="") as output:
+              output.write(r'''<?xml version="1.0" encoding="utf-8"?>
+          <Project ToolsVersion="Current" DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+            <Import Project="$(MSBuildExtensionsPath)\$(MSBuildToolsVersion)\Microsoft.Common.props" Condition="Exists('$(MSBuildExtensionsPath)\$(MSBuildToolsVersion)\Microsoft.Common.props')" />
+            <PropertyGroup>
+              <Configuration Condition="'$(Configuration)'==''">Debug</Configuration>
+              <Platform Condition="'$(Platform)'==''">x64</Platform>
+              <ProjectGuid>{8EF2EC60-EF4A-46E4-92BC-C48271B1E847}</ProjectGuid>
+              <OutputType>AppContainerExe</OutputType>
+              <RootNamespace>NexiaCMZLoader</RootNamespace>
+              <AssemblyName>NexiaCMZLoader</AssemblyName>
+              <DefaultLanguage>en-US</DefaultLanguage>
+              <TargetPlatformIdentifier>UAP</TargetPlatformIdentifier>
+              <TargetPlatformVersion Condition="'$(TargetPlatformVersion)'==''">10.0.19041.0</TargetPlatformVersion>
+              <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
+              <MinimumVisualStudioVersion>17.0</MinimumVisualStudioVersion>
+              <ProjectTypeGuids>{A5A43C5B-DE2A-4C0C-9213-0A381AF9435A};{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}</ProjectTypeGuids>
+              <FileAlignment>512</FileAlignment>
+              <LangVersion>10.0</LangVersion>
+              <Nullable>disable</Nullable>
+              <EnableDotNetNativeCompatibleProfile>true</EnableDotNetNativeCompatibleProfile>
+              <UseDotNetNativeToolchain>false</UseDotNetNativeToolchain>
+              <AppxPackageSigningEnabled>false</AppxPackageSigningEnabled>
+              <AppxAutoIncrementPackageRevision>false</AppxAutoIncrementPackageRevision>
+              <GenerateAppInstallerFile>false</GenerateAppInstallerFile>
+              <AppxBundle>Never</AppxBundle>
+              <AppxSymbolPackageEnabled>false</AppxSymbolPackageEnabled>
+              <GenerateAppxPackageOnBuild>true</GenerateAppxPackageOnBuild>
+              <RestoreProjectStyle>PackageReference</RestoreProjectStyle>
+            </PropertyGroup>
+            <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+              <DebugSymbols>true</DebugSymbols>
+              <DebugType>full</DebugType>
+              <OutputPath>bin\x64\Debug\</OutputPath>
+              <DefineConstants>DEBUG;TRACE;NETFX_CORE;WINDOWS_UWP;WINDOWS_UAP</DefineConstants>
+              <PlatformTarget>x64</PlatformTarget>
+              <Prefer32Bit>false</Prefer32Bit>
+              <UseVSHostingProcess>false</UseVSHostingProcess>
+              <Optimize>false</Optimize>
+            </PropertyGroup>
+            <ItemGroup>
+              <ApplicationDefinition Include="App.xaml"><Generator>MSBuild:Compile</Generator><SubType>Designer</SubType></ApplicationDefinition>
+              <Compile Include="App.xaml.cs"><DependentUpon>App.xaml</DependentUpon></Compile>
+              <Compile Include="CmzLoader.cs" />
+              <Compile Include="LocalServices.cs" />
+              <Compile Include="LocalStorage.cs" />
+              <Compile Include="NexiaGuardedSignatures.cs" />
+
+              <AppxManifest Include="Package.appxmanifest"><SubType>Designer</SubType></AppxManifest>
+              <Content Include="Assets\*.png" />
+              <Content Include="NEXIA-LICENSE.txt" /><Content Include="MONOGAME-LICENSE.txt" />
+              <Content Include="THIRD-PARTY-NOTICES.txt" /><Content Include="SOURCE-PROVENANCE.json" />
+            </ItemGroup>
+            <ItemGroup>
+              <PackageReference Include="Microsoft.NETCore.UniversalWindowsPlatform" Version="6.2.14" />
+              <PackageReference Include="Mono.Cecil" Version="0.11.6" />
+              <PackageReference Include="MonoGame.Framework.WindowsUniversal" Version="3.8.1.303" />
+            </ItemGroup>
+            <Import Project="$(MSBuildExtensionsPath)\Microsoft\WindowsXaml\v$(VisualStudioVersion)\Microsoft.Windows.UI.Xaml.CSharp.targets" />
+          </Project>
+          ''')
+      - name: Write Package.appxmanifest (1 of 1)
+        shell: python
+        run: |
+          from pathlib import Path
+          root = Path("xbox-cmz-services")
+          root.mkdir(exist_ok=True)
+          with (root / 'Package.appxmanifest').open('w', encoding="utf-8", newline="") as output:
+              output.write(r'''<?xml version="1.0" encoding="utf-8"?>
+          <Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+                   xmlns:mp="http://schemas.microsoft.com/appx/2014/phone/manifest"
+                   xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10" IgnorableNamespaces="uap mp">
+            <Identity Name="NexiaCMZLoader" Publisher="CN=NexiaCMZLoader" Version="0.6.1.0" ProcessorArchitecture="x64" />
+            <mp:PhoneIdentity PhoneProductId="8ef2ec60-ef4a-46e4-92bc-c48271b1e847" PhonePublisherId="00000000-0000-0000-0000-000000000000" />
+            <Properties>
+              <DisplayName>CMZ Assembly Loader</DisplayName>
+              <PublisherDisplayName>Personal Xbox port experiment</PublisherDisplayName>
+              <Logo>Assets\StoreLogo.png</Logo>
+            </Properties>
+            <Dependencies><TargetDeviceFamily Name="Windows.Universal" MinVersion="10.0.17763.0" MaxVersionTested="10.0.19041.0" /></Dependencies>
+            <Resources><Resource Language="en-us" /></Resources>
+            <Applications>
+              <Application Id="App" Executable="$targetnametoken$.exe" EntryPoint="NexiaCMZLoader.App">
+                <uap:VisualElements DisplayName="CMZ Assembly Loader" Description="Managed runtime experiment. Not an emulator."
+                    BackgroundColor="#101820" Square150x150Logo="Assets\Square150.png" Square44x44Logo="Assets\Square44.png">
+                  <uap:SplashScreen Image="Assets\Splash.png" />
+                </uap:VisualElements>
+              </Application>
+            </Applications>
+          </Package>
+          ''')
+      - name: Write build.ps1 (1 of 1)
+        shell: python
+        run: |
+          from pathlib import Path
+          root = Path("xbox-cmz-services")
+          root.mkdir(exist_ok=True)
+          with (root / 'build.ps1').open('w', encoding="utf-8", newline="") as output:
+              output.write(r'''param([ValidateRange(1,65535)][int]$BuildNumber = 1)
+          $ErrorActionPreference = 'Stop'
+          Set-StrictMode -Version Latest
+          $root = $PSScriptRoot
+          $out = Join-Path $root 'out'
+          $packages = Join-Path $root 'AppPackages'
+          New-Item -ItemType Directory -Force $out, "$root\Assets", "$out\Dependencies", $packages | Out-Null
+          Start-Transcript -Path "$out\build-transcript.txt" -Force | Out-Null
+          try {
+              $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+              if (!(Test-Path $vswhere)) { throw 'Visual Studio locator is missing.' }
+              $vs = & $vswhere -latest -products '*' -version '[17.0,18.0)' -property installationPath
+              if (!$vs) { throw 'Visual Studio 2022 is required.' }
+              $msbuild = Join-Path $vs 'MSBuild\Current\Bin\MSBuild.exe'
+              $kits = "${env:ProgramFiles(x86)}\Windows Kits\10"
+              $versions = @(Get-ChildItem "$kits\bin" -Directory | Where-Object {
+                  $_.Name -match '^10\.0\.\d+\.0$' -and
+                  (Test-Path (Join-Path $_.FullName 'x64\makeappx.exe')) -and
+                  (Test-Path (Join-Path $_.FullName 'x64\signtool.exe'))
+              } | Sort-Object { [version]$_.Name } -Descending)
+              if (!$versions.Count) { throw 'Windows SDK packaging tools are missing.' }
+              $sdk = $versions[0].Name
+              if (@($versions | Where-Object Name -eq '10.0.19041.0').Count) { $sdk = '10.0.19041.0' }
+              Write-Host "Visual Studio: $vs"
+              Write-Host "SDK: $sdk; managed UWP Debug x64; .NET Native DISABLED intentionally"
+
+              Add-Type -AssemblyName System.Drawing
+              foreach ($asset in @(@('StoreLogo.png',50,50), @('Square44.png',44,44), @('Square150.png',150,150), @('Splash.png',620,300))) {
+                  $bitmap = [Drawing.Bitmap]::new([int]$asset[1], [int]$asset[2])
+                  $graphics = [Drawing.Graphics]::FromImage($bitmap)
+                  $brush = [Drawing.SolidBrush]::new([Drawing.Color]::FromArgb(230,180,70))
+                  try {
+                      $graphics.Clear([Drawing.Color]::FromArgb(16,24,32))
+                      $graphics.FillRectangle($brush, [int]($asset[1]/4), [int]($asset[2]/4), [int]($asset[1]/2), [int]($asset[2]/2))
+                      $bitmap.Save((Join-Path "$root\Assets" $asset[0]), [Drawing.Imaging.ImageFormat]::Png)
+                  } finally { $brush.Dispose(); $graphics.Dispose(); $bitmap.Dispose() }
+              }
+              [xml]$manifest = Get-Content "$root\Package.appxmanifest" -Raw
+              $manifest.Package.Identity.Version = "0.6.$BuildNumber.0"
+              $manifest.Package.Dependencies.TargetDeviceFamily.MaxVersionTested = $sdk
+              $manifest.Save("$root\Package.appxmanifest")
+
+              & $msbuild "$root\ManagedProbe.csproj" /restore /m /t:Build /v:minimal `
+                  /p:Configuration=Debug /p:Platform=x64 "/p:TargetPlatformVersion=$sdk" `
+                  /p:UseDotNetNativeToolchain=false /p:AppxPackageSigningEnabled=false `
+                  /p:GenerateAppxPackageOnBuild=true /p:AppxBundle=Never `
+                  /p:UapAppxPackageBuildMode=SideloadOnly "/p:AppxPackageDir=$packages\" `
+                  "/flp:LogFile=$out\msbuild.log;Verbosity=normal" `
+                  "/bl:$out\build.binlog"
+              if ($LASTEXITCODE -ne 0) { throw "Managed UWP build failed ($LASTEXITCODE). See build.binlog and transcript." }
+
+              Get-ChildItem $packages -Recurse -File | Select-Object FullName,Length | Format-Table -AutoSize | Out-String -Width 300 | Set-Content "$out\package-inventory.txt"
+              $apps = @(Get-ChildItem $packages -Recurse -File | Where-Object {
+                  $_.Extension -in @('.appx', '.msix') -and $_.FullName -notmatch '[\\/]Dependencies[\\/]'
+              })
+              if ($apps.Count -ne 1) { throw "Expected one main APPX; found $($apps.Count)." }
+              $package = Join-Path $root "NexiaCMZLoader_0.6.${BuildNumber}.0_x64$($apps[0].Extension)"
+              Copy-Item $apps[0].FullName $package
+              $dependencyFiles = @(Get-ChildItem $packages -Recurse -File | Where-Object {
+                  $_.Extension -in @('.appx', '.msix') -and $_.FullName -match '[\\/]Dependencies[\\/]' -and $_.FullName -match '[\\/](x64|neutral)[\\/]'
+              })
+              foreach ($dependency in $dependencyFiles) {
+                  Copy-Item $dependency.FullName (Join-Path "$out\Dependencies" $dependency.Name) -Force
+              }
+
+              # Fail visibly if a declared dependency is not included. Do not substitute
+              # a desktop .NET runtime or assume it is already installed on the Xbox.
+              Add-Type -AssemblyName System.IO.Compression.FileSystem
+              function Read-AppxManifest([string]$Path) {
+                  $archive = [IO.Compression.ZipFile]::OpenRead($Path)
+                  try {
+                      $entry = $archive.GetEntry('AppxManifest.xml')
+                      if (!$entry) { throw "Missing APPX manifest: $Path" }
+                      $reader = [IO.StreamReader]::new($entry.Open())
+                      try { return [xml]$reader.ReadToEnd() } finally { $reader.Dispose() }
+                  } finally { $archive.Dispose() }
+              }
+              $contentsCheck = [IO.Compression.ZipFile]::OpenRead($package)
+              try {
+                  foreach ($requiredFile in @('MonoGame.Framework.dll', 'Mono.Cecil.dll')) {
+                      if (!$contentsCheck.GetEntry($requiredFile)) { throw "Required assembly missing: $requiredFile" }
+                  }
+                  foreach ($entry in $contentsCheck.Entries) {
+                      if ($entry.FullName -match '(^|[/\\])(CastleMinerZ\.exe|DNA\.Common\.dll|CastleMinerZ-assemblies\.zip)$') {
+                          throw 'Original game files must not be in the public build artifact.'
+                      }
+                  }
+              } finally { $contentsCheck.Dispose() }
+              $mainManifest = Read-AppxManifest $package
+              if ($mainManifest.Package.Identity.Name -ne 'NexiaCMZLoader' -or
+                  $mainManifest.Package.Identity.Publisher -ne 'CN=NexiaCMZLoader' -or
+                  $mainManifest.Package.Identity.ProcessorArchitecture -ne 'x64') {
+                  throw 'Unexpected package identity, publisher or architecture.'
+              }
+              $available = @{}
+              foreach ($file in @(Get-ChildItem "$out\Dependencies" -File | Where-Object { $_.Extension -in @('.appx', '.msix') })) {
+                  $dependencyManifest = Read-AppxManifest $file.FullName
+                  $identity = $dependencyManifest.Package.Identity
+                  $available[[string]$identity.Name] = [version]$identity.Version
+                  Write-Host "Included dependency: $($identity.Name) $($identity.Version)"
+              }
+              $required = @($mainManifest.SelectNodes('//*[local-name()="PackageDependency"]'))
+              foreach ($dependency in $required) {
+                  $name = $dependency.GetAttribute('Name')
+                  $minimum = [version]$dependency.GetAttribute('MinVersion')
+                  if (!$available.ContainsKey($name) -or $available[$name] -lt $minimum) {
+                      throw "Missing packaged dependency: $name >= $minimum. Return the build logs; do not install random runtime files."
+                  }
+              }
+              if (@($required | Where-Object { $_.GetAttribute('Name') -like 'Microsoft.NET.Native*' }).Count) {
+                  throw 'This diagnostic unexpectedly targets .NET Native rather than the intended managed runtime.'
+              }
+              if (!@($required | Where-Object { $_.GetAttribute('Name') -like 'Microsoft.NET.CoreRuntime*' }).Count) {
+                  throw 'Expected a UWP CoreRuntime dependency; inspect the manifest before testing.'
+              }
+              $mainManifest.OuterXml | Set-Content "$out\packaged-manifest.xml" -Encoding utf8
+
+              $cert = New-SelfSignedCertificate -Type Custom -Subject 'CN=NexiaCMZLoader' `
+                  -KeyUsage DigitalSignature -KeyAlgorithm RSA -KeyLength 2048 -HashAlgorithm SHA256 `
+                  -CertStoreLocation 'Cert:\CurrentUser\My' `
+                  -TextExtension @('2.5.29.37={text}1.3.6.1.5.5.7.3.3') -NotAfter (Get-Date).AddMonths(6)
+              try {
+                  & "$kits\bin\$sdk\x64\signtool.exe" sign /fd SHA256 /s My /sha1 $cert.Thumbprint $package
+                  if ($LASTEXITCODE -ne 0) { throw 'APPX signing failed.' }
+                  Export-Certificate -Cert $cert -FilePath "$out\NexiaCMZLoader.cer" | Out-Null
+              } finally { Remove-Item "Cert:\CurrentUser\My\$($cert.Thumbprint)" -ErrorAction SilentlyContinue }
+              Copy-Item "$root\MONOGAME-LICENSE.txt" $out
+              Copy-Item "$root\SOURCE-PROVENANCE.json" $out
+              Copy-Item $package $out
+              Copy-Item "$root\README.txt", "$root\NEXIA-LICENSE.txt", "$root\THIRD-PARTY-NOTICES.txt" $out
+              Get-FileHash $package -Algorithm SHA256 | Format-List | Out-File "$out\SHA256.txt"
+              Write-Host 'CMZ SERVICES CHECK BUILT. New offline self-tests and game linking remain untested on Xbox.'
+          } finally { Stop-Transcript | Out-Null }
+          ''')
+      - name: Write NuGet.Config (1 of 1)
+        shell: python
+        run: |
+          from pathlib import Path
+          root = Path("xbox-cmz-services")
+          root.mkdir(exist_ok=True)
+          with (root / 'NuGet.Config').open('w', encoding="utf-8", newline="") as output:
+              output.write(r'''<?xml version="1.0" encoding="utf-8"?>
+          <configuration><packageSources><clear /><add key="nuget.org" value="https://api.nuget.org/v3/index.json" /></packageSources></configuration>
+          ''')
+      - name: Write NEXIA-LICENSE.txt (1 of 1)
+        shell: python
+        run: |
+          from pathlib import Path
+          root = Path("xbox-cmz-services")
+          root.mkdir(exist_ok=True)
+          with (root / 'NEXIA-LICENSE.txt').open('w', encoding="utf-8", newline="") as output:
+              output.write(r'''Copyright (c) 2015, Ben Vanik.
+          All rights reserved.
+
+          Redistribution and use in source and binary forms, with or without
+          modification, are permitted provided that the following conditions are met:
+              * Redistributions of source code must retain the above copyright
+                notice, this list of conditions and the following disclaimer.
+              * Redistributions in binary form must reproduce the above copyright
+                notice, this list of conditions and the following disclaimer in the
+                documentation and/or other materials provided with the distribution.
+              * Neither the name of the project nor the
+                names of its contributors may be used to endorse or promote products
+                derived from this software without specific prior written permission.
+
+          THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+          ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+          WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+          DISCLAIMED. IN NO EVENT SHALL BEN VANIK BE LIABLE FOR ANY
+          DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+          (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+          LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+          ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+          (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+          SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+          ''')
+      - name: Write MONOGAME-LICENSE.txt (1 of 1)
+        shell: python
+        run: |
+          from pathlib import Path
+          root = Path("xbox-cmz-services")
+          root.mkdir(exist_ok=True)
+          with (root / 'MONOGAME-LICENSE.txt').open('w', encoding="utf-8", newline="") as output:
+              output.write(r'''﻿Microsoft Public License (Ms-PL)
+          MonoGame - Copyright © 2009-2021 The MonoGame Team
+
+          All rights reserved.
+
+          This license governs use of the accompanying software. If you use the software,
+          you accept this license. If you do not accept the license, do not use the
+          software.
+
+          1. Definitions
+
+          The terms "reproduce," "reproduction," "derivative works," and "distribution"
+          have the same meaning here as under U.S. copyright law.
+
+          A "contribution" is the original software, or any additions or changes to the
+          software.
+
+          A "contributor" is any person that distributes its contribution under this
+          license.
+
+          "Licensed patents" are a contributor's patent claims that read directly on its
+          contribution.
+
+          2. Grant of Rights
+
+          (A) Copyright Grant- Subject to the terms of this license, including the
+          license conditions and limitations in section 3, each contributor grants you a
+          non-exclusive, worldwide, royalty-free copyright license to reproduce its
+          contribution, prepare derivative works of its contribution, and distribute its
+          contribution or any derivative works that you create.
+
+          (B) Patent Grant- Subject to the terms of this license, including the license
+          conditions and limitations in section 3, each contributor grants you a
+          non-exclusive, worldwide, royalty-free license under its licensed patents to
+          make, have made, use, sell, offer for sale, import, and/or otherwise dispose of
+          its contribution in the software or derivative works of the contribution in the
+          software.
+
+          3. Conditions and Limitations
+
+          (A) No Trademark License- This license does not grant you rights to use any
+          contributors' name, logo, or trademarks.
+
+          (B) If you bring a patent claim against any contributor over patents that you
+          claim are infringed by the software, your patent license from such contributor
+          to the software ends automatically.
+
+          (C) If you distribute any portion of the software, you must retain all
+          copyright, patent, trademark, and attribution notices that are present in the
+          software.
+
+          (D) If you distribute any portion of the software in source code form, you may
+          do so only under this license by including a complete copy of this license with
+          your distribution. If you distribute any portion of the software in compiled or
+          object code form, you may only do so under a license that complies with this
+          license.
+
+          (E) The software is licensed "as-is." You bear the risk of using it. The
+          contributors give no express warranties, guarantees or conditions. You may have
+          additional consumer rights under your local laws which this license cannot
+          change. To the extent permitted under your local laws, the contributors exclude
+          the implied warranties of merchantability, fitness for a particular purpose and
+          non-infringement.
+
+          -------------------------------------------------------------------------------
+
+          The MIT License (MIT)
+          Portions Copyright © The Mono.Xna Team
+
+          Permission is hereby granted, free of charge, to any person obtaining a copy
+          of this software and associated documentation files (the "Software"), to deal
+          in the Software without restriction, including without limitation the rights
+          to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+          copies of the Software, and to permit persons to whom the Software is
+          furnished to do so, subject to the following conditions:
+
+          The above copyright notice and this permission notice shall be included in
+          all copies or substantial portions of the Software.
+
+          THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+          IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+          FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+          AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+          LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+          OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+          THE SOFTWARE.
+          ''')
+      - name: Write THIRD-PARTY-NOTICES.txt (1 of 1)
+        shell: python
+        run: |
+          from pathlib import Path
+          root = Path("xbox-cmz-services")
+          root.mkdir(exist_ok=True)
+          with (root / 'THIRD-PARTY-NOTICES.txt').open('w', encoding="utf-8", newline="") as output:
+              output.write(r'''CMZ SERVICES CHECK 0.6
+          Adapted Nexia/Xenia XNA signatures and storage code (BSD-3-Clause).
+          See NEXIA-LICENSE.txt and SOURCE-PROVENANCE.json for precise attribution.
+          Nexia signatures are not evidence of implemented gameplay or avatar services.
+          New local behavior is experimental and is clearly separated from guarded declarations.
+
+          CMZ ASSEMBLY LOADER 0.5 - ORIGINAL EXPERIMENT CODE
+          No CastleMiner Z binary, asset or complete Nexia emulator is included.
+          Uses legacy MonoGame.Framework.WindowsUniversal 3.8.1.303.
+          See included MONOGAME-LICENSE.txt (Ms-PL and MIT). SharpDX packages use MIT.
+          No contributor or publisher endorsement is claimed.
+
+          Mono.Cecil 0.11.6 (NuGet)
+          https://github.com/jbevain/cecil/blob/0.11.6/LICENSE.txt
+
+          Copyright (c) 2008 - 2015 Jb Evain
+          Copyright (c) 2008 - 2011 Novell, Inc.
+
+          Permission is hereby granted, free of charge, to any person obtaining
+          a copy of this software and associated documentation files (the
+          "Software"), to deal in the Software without restriction, including
+          without limitation the rights to use, copy, modify, merge, publish,
+          distribute, sublicense, and/or sell copies of the Software, and to
+          permit persons to whom the Software is furnished to do so, subject to
+          the following conditions:
+
+          The above copyright notice and this permission notice shall be
+          included in all copies or substantial portions of the Software.
+
+          THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+          EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+          MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+          NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+          LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+          OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+          WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+          Microsoft.NETCore.UniversalWindowsPlatform 6.2.14 and its runtime dependencies
+          are restored from the official NuGet feed under their applicable package licenses.
+          Microsoft runtime packages retain their packaged manifests and signatures.
+          ''')
+      - name: Write SOURCE-PROVENANCE.json (1 of 1)
+        shell: python
+        run: |
+          from pathlib import Path
+          root = Path("xbox-cmz-services")
+          root.mkdir(exist_ok=True)
+          with (root / 'SOURCE-PROVENANCE.json').open('w', encoding="utf-8", newline="") as output:
+              output.write(r'''{
+            "repository": "tjkeelan13-ctrl/Nexia360-emulation-edition",
+            "reference_commit": "a7dbc4fef5738fddfbaf84e9401d5ad780b84460",
+            "license": "BSD-3-Clause (NEXIA-LICENSE.txt)",
+            "inputs": [
+              {
+                "source": "GamerServices/Stubs.cs",
+                "git_blob_sha1": "b45da2b4dc5cd54ef8ca4dae034778d4a8c6dfe9",
+                "sha256": "223ff097fd9fd4deb1c64a4e768bedbd9a8d12e51fe1944910c0e5cc9ac99265"
+              },
+              {
+                "source": "Net/Stubs.cs",
+                "git_blob_sha1": "dfb73948f9805244a0d53ed17538900adeff46e3",
+                "sha256": "66337cb01e40b34e770756f579dd532eb6f0e29f2d9b64f94fe32e1c801f3121"
+              },
+              {
+                "source": "Avatar/Stubs.cs",
+                "git_blob_sha1": "64607d2cfc720d694a9e5171a00ac69d36939ce8",
+                "sha256": "179efa40ab1699b6530afe8ef2b16de29f94538377bfc7fb15b44045a2ba95d2"
+              },
+              {
+                "source": "Storage/Stubs.cs",
+                "git_blob_sha1": "a3508212601e4a4f3c196f0850f7c842abe3fcfa",
+                "sha256": "343540b50b2ae58b1c41424b7f363d8be5e3ee66bdd53e6cf7efb21fb1007e07"
+              },
+              {
+                "source": "Storage/Extra.cs",
+                "git_blob_sha1": "7b877721a75c78501192b087897e784e9df9d619",
+                "sha256": "eb7eef3a538c124e1fd8e1a4a4219a8fd4652044646dc8b9d79fdf1a5676de0c"
+              }
+            ],
+            "changes": {
+              "NexiaGuardedSignatures.cs": "Removed replaced offline definitions and converted unimplemented executable members to explicit NotSupportedException; retained enum/type declarations.",
+              "LocalStorage.cs": "Adapted Nexia Storage Stubs/Extra to app-local per-slot storage. Fixed directory boundary/rooted-path rejection and disposal checks. Capacity values are not implemented.",
+              "LocalServices.cs": "Original experimental offline services and synthetic-slot tests, matched against XNA declarations. No game is started."
+            }
+          }''')
+      - name: Write README.txt (1 of 1)
+        shell: python
+        run: |
+          from pathlib import Path
+          root = Path("xbox-cmz-services")
+          root.mkdir(exist_ok=True)
+          with (root / 'README.txt').open('w', encoding="utf-8", newline="") as output:
+              output.write(r'''CMZ SERVICES CHECK 0.6 -- EXPERIMENTAL, NOT A PLAYABLE GAME
+
+          Purpose
+          Extend the successful assembly loader with missing XNA type declarations and
+          explicit experimental offline services. This is not a completed Nexia port.
+
+          Scope
+          - Original game inputs and SHA-256 checks are unchanged.
+          - The app still does NOT invoke Program.Main or any game constructor.
+          - Real local service code implements synthetic local profiles, a small in-process
+            session, owned packet queues, create/start/end/join events, and slot-separated
+            storage. These are self-tested inside the Xbox app before assembly inspection.
+          - No physical-controller integration, world simulation, split-screen camera,
+            inventory, gamer picture, original avatar, online matchmaking, license service,
+            achievements, or actual game content is exercised here.
+          - Many extra XNA declarations come from Nexia's generated signatures. Their
+            unimplemented accessors/methods explicitly throw NotSupportedException rather
+            than return fake success. Linked types do NOT mean those features work.
+          - Local broadcast semantics are provisional: sends target other local players;
+            an explicit recipient may be the sender. Exact game protocol use needs testing.
+          - Local network sessions reject non-local modes. There are no network capabilities
+            and no request to connect to any online service.
+          - Device free/total-space reporting and guide/license UI remain explicit blockers.
+          - Type mapping now searches past non-public runtime lookalikes and preserves the
+            original scopes of nested type references before rewriting them.
+          - Field/parameter/return signature inspection records additional metadata errors.
+            It is not a method-body/JIT validation or successful game-startup test.
+
+          Install sequence
+          1. Add the new workflow .github/workflows/xbox-cmz-services.yml FROM REPOSITORY ROOT.
+          2. Wait for a successful build and inspect the output before installation.
+          3. The installer retains Name=NexiaCMZLoader and Publisher=CN=NexiaCMZLoader,
+             increasing the package version to 0.6.<run>.0. It is intended to update the
+             installed 0.5 loader while retaining its game ZIP. Update behavior is untested.
+          4. Back up the old cmz-loader-log.txt and keep CastleMinerZ-assemblies.zip on phone.
+             Do not uninstall the app or framework packages to resolve an update error.
+          5. Install the resulting package via Device Portal, using included dependencies
+             if necessary, retain Game mode, and launch.
+          6. The expected input remains LocalState/CastleMinerZ-assemblies.zip. The archive
+             is not an installer or a framework dependency. Do not publish it on GitHub.
+          7. Send the result and LocalState/cmz-loader-log.txt. Log resets on each launch.
+
+          Test limits
+          At preparation time only generation, XML, static dependency-name coverage and
+          source delimiter checks were performed locally. The UWP C# compilation, package
+          update and new runtime self-tests have NOT yet run. Do not describe these sources
+          as a verified working game, networking implementation, or avatar renderer.
+
+          Couch co-op target remains two independent local players in one original world.
+          The self-test uses synthetic player slots, not two physical controllers. Passing
+          it would verify its narrow internal assertions, not couch co-op gameplay.
+
+          Source attribution
+          See NEXIA-LICENSE.txt, MONOGAME-LICENSE.txt, THIRD-PARTY-NOTICES.txt and
+          SOURCE-PROVENANCE.json. All original game binaries/assets are excluded from this
+          source package and workflow. They remain only in the user's original input ZIP.
+          ''')
+
+      - name: Build and sign CMZ services check
+        shell: pwsh
+        env:
+          PROBE_BUILD_NUMBER: ${{ github.run_number }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tokens = $null
+          $parseErrors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            "$PWD/xbox-cmz-services/build.ps1", [ref]$tokens, [ref]$parseErrors
+          ) | Out-Null
+          if ($parseErrors.Count -gt 0) { throw ($parseErrors | Out-String) }
+          ./xbox-cmz-services/build.ps1 -BuildNumber ([int]$env:PROBE_BUILD_NUMBER)
+
+      - name: Upload signed package or build logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: XboxCMZServices-x64-${{ github.run_number }}
+          path: xbox-cmz-services/out/
+          retention-days: 7
+          if-no-files-found: warn
