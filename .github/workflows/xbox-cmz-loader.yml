@@ -1,0 +1,446 @@
+# Create from the repository root. Keep earlier working workflows unchanged.
+name: Xbox - CMZ Assembly Loader
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [Mousehook]
+    paths:
+      - '.github/workflows/xbox-cmz-loader.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: xbox-cmz-loader-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 25
+    steps:
+      - name: Prepare real-game assembly loader
+        shell: python
+        run: |
+          import hashlib
+          import re
+          import textwrap
+          from pathlib import Path
+          from urllib.request import urlopen
+
+          # Reuse only the immutable preparation step of the known successful build.
+          url = ('https://raw.githubusercontent.com/'
+                 'tjkeelan13-ctrl/Nexia360-emulation-edition/'
+                 'c1a9d425bba580f1198f34dae728236028d9f616/'
+                 '.github/workflows/xbox-managed-build.yml')
+          with urlopen(url, timeout=45) as response:
+              data = response.read()
+          if hashlib.sha256(data).hexdigest() != '8125a5447c4769bb0579d555751929c6be565c0655167fe74ea5496dcd116ae2':
+              raise RuntimeError('Base workflow integrity mismatch')
+          blocks = re.findall(r'(?m)^        run: \|\n((?: {10}.*\n|\n)*)', data.decode('utf-8-sig'))
+          if len(blocks) != 2:
+              raise RuntimeError('Unexpected base workflow structure')
+          exec(compile(textwrap.dedent(blocks[0]), 'verified-managed-preparation', 'exec'), {})
+          root = Path('xbox-managed-probe')
+          for name in ['App.xaml', 'ManagedProbe.csproj', 'Package.appxmanifest', 'build.ps1']:
+              path = root / name
+              text = path.read_text(encoding='utf-8')
+              text = text.replace('NexiaXboxManagedProbe', 'NexiaCMZLoader')
+              text = text.replace('Nexia Managed Probe', 'CMZ Assembly Loader')
+              text = text.replace('0.2.', '0.5.')
+              text = text.replace('0cf44b44-3d0a-4c82-969b-cfb64774c99e', '8ef2ec60-ef4a-46e4-92bc-c48271b1e847')
+              text = text.replace('0CF44B44-3D0A-4C82-969B-CFB64774C99E', '8EF2EC60-EF4A-46E4-92BC-C48271B1E847')
+              path.write_text(text, encoding='utf-8')
+
+          def patch(name, before, after):
+              path = root / name
+              text = path.read_text(encoding='utf-8')
+              if text.count(before) != 1:
+                  raise RuntimeError('Patch location missing or ambiguous: ' + name)
+              path.write_text(text.replace(before, after, 1), encoding='utf-8')
+
+          (root / 'App.xaml.cs').write_text(r'''using System;
+          using System.IO;
+          using System.Threading.Tasks;
+          using Windows.ApplicationModel.Activation;
+          using Windows.Storage;
+          using Windows.UI.Xaml;
+          using Windows.UI.Xaml.Controls;
+          using Windows.UI.Xaml.Media;
+
+          namespace NexiaCMZLoader
+          {
+              sealed partial class App : Application
+              {
+                  private bool launched;
+                  public App()
+                  {
+                      InitializeComponent();
+                      RequiresPointerMode = ApplicationRequiresPointerMode.WhenRequested;
+                  }
+                  protected override async void OnLaunched(LaunchActivatedEventArgs args)
+                  {
+                      if (launched) { Window.Current.Activate(); return; }
+                      launched = true;
+                      var output = new TextBlock {
+                          Text = "CASTLEMINER Z ASSEMBLY LOADER 0.5\nChecking original game assemblies...\nThis is not playable yet.",
+                          FontSize = 22, TextWrapping = TextWrapping.Wrap,
+                          Foreground = new SolidColorBrush(Windows.UI.Colors.White),
+                          Margin = new Thickness(48, 32, 48, 32)
+                      };
+                      Window.Current.Content = new ScrollViewer {
+                          Content = output, VerticalScrollBarVisibility = ScrollBarVisibility.Auto
+                      };
+                      Window.Current.Activate();
+                      string folder = ApplicationData.Current.LocalFolder.Path;
+                      try {
+                          output.Text = await Task.Run(() => new CmzLoader(folder).Run());
+                      } catch (Exception ex) {
+                          output.Text = "LOADER ERROR\n" + ex + "\nNo game was started.";
+                          try { File.AppendAllText(Path.Combine(folder, "cmz-loader-log.txt"), ex.ToString()); }
+                          catch { }
+                      }
+                  }
+              }
+          }
+          ''', encoding='utf-8')
+
+          (root / 'CmzLoader.cs').write_text(r'''// Read-only original inputs; retargeted copies belong to this test app only.
+          // No Main, game constructor, gameplay, online service or avatar is executed.
+          using System;
+          using System.Collections.Generic;
+          using System.IO;
+          using System.IO.Compression;
+          using System.Linq;
+          using System.Reflection;
+          using System.Security.Cryptography;
+          using Mono.Cecil;
+          using Windows.System.Profile;
+
+          namespace NexiaCMZLoader
+          {
+              internal sealed class CmzLoader
+              {
+                  private readonly string folder;
+                  private readonly string logPath;
+                  private readonly List<string> summary = new List<string>();
+                  private readonly List<Assembly> providers = new List<Assembly>();
+                  private readonly Dictionary<string, Type> typeCache = new Dictionary<string, Type>();
+                  private readonly HashSet<string> unresolved = new HashSet<string>();
+                  private object context;
+                  private MethodInfo loadStream;
+                  private int mapped;
+
+                  internal CmzLoader(string localFolder)
+                  {
+                      folder = localFolder;
+                      logPath = Path.Combine(folder, "cmz-loader-log.txt");
+                  }
+                  private void Log(string text) { File.AppendAllText(logPath, text + "\r\n"); }
+                  private void Show(string text) { summary.Add(text); Log(text); }
+                  internal string Run()
+                  {
+                      File.WriteAllText(logPath, "CMZ assembly check " + DateTime.UtcNow.ToString("O") + "\r\n");
+                      Show("CASTLEMINER Z ASSEMBLY LOADER 0.5 - NOT PLAYABLE");
+                      Show("Device: " + AnalyticsInfo.VersionInfo.DeviceFamily);
+                      Log("Runtime: " + typeof(object).Assembly.FullName);
+                      Log("Couch co-op requirement: two independent local players sharing one world. NOT implemented here.");
+                      string zipPath = Path.Combine(folder, "CastleMinerZ-assemblies.zip");
+                      if (!File.Exists(zipPath)) {
+                          Show("WAITING FOR YOUR GAME FILES");
+                          Show("Upload CastleMinerZ-assemblies.zip into this app's LocalState.");
+                          Show("Keep the ZIP intact, then fully close and reopen this app.");
+                          return string.Join("\n", summary);
+                      }
+                      try {
+                          string originals = Path.Combine(folder, "OriginalAssemblies");
+                          string prepared = Path.Combine(folder, "PreparedAssemblies");
+                          Directory.CreateDirectory(originals);
+                          Directory.CreateDirectory(prepared);
+                          Import(zipPath, originals);
+                          Show("Original CastleMinerZ.exe + DNA.Common.dll: verified");
+                          DiscoverContext();
+                          Show("Public stream loader: available");
+                          AddProvider(typeof(object).Assembly);
+                          AddProvider(typeof(Enumerable).Assembly);
+                          AddProvider(typeof(File).Assembly);
+                          AddProvider(typeof(Uri).Assembly);
+                          AddProvider(typeof(System.Threading.Thread).Assembly);
+                          AddProvider(typeof(Microsoft.Xna.Framework.Game).Assembly);
+                          foreach (string name in new[] { "System.Runtime", "System.Collections", "System.Linq",
+                              "System.IO", "System.Reflection", "System.Threading", "System.Threading.Tasks",
+                              "System.Xml.ReaderWriter", "System.Xml.XDocument", "System.Net.Primitives",
+                              "System.Net.Sockets", "System.Runtime.Extensions", "System.Globalization" }) {
+                              try { AddProvider(Assembly.Load(new AssemblyName(name))); }
+                              catch (Exception ex) { Log("Optional type provider " + name + ": " + ex.Message); }
+                          }
+                          string[] names = { "DNA.Common.dll", "CastleMinerZ.exe" };
+                          foreach (string name in names) {
+                              Retarget(Path.Combine(originals, name), Path.Combine(prepared, name));
+                          }
+                          Show("Framework type references mapped: " + mapped);
+                          Show("Unresolved framework type names: " + unresolved.Count + " (details in log)");
+                          foreach (string missing in unresolved.OrderBy(x => x)) Log("UNMAPPED " + missing);
+                          var loaded = new Dictionary<string, Assembly>();
+                          foreach (string name in names) {
+                              try {
+                                  Assembly assembly;
+                                  using (var stream = new MemoryStream(File.ReadAllBytes(Path.Combine(prepared, name))))
+                                      assembly = (Assembly)loadStream.Invoke(context, new object[] { stream });
+                                  loaded.Add(name, assembly);
+                                  Show(name + ": assembly loaded");
+                                  Log("Loaded identity: " + assembly.FullName);
+                                  InspectTypes(name, assembly);
+                              } catch (Exception ex) {
+                                  ex = Unwrap(ex);
+                                  Show(name + ": LOAD FAILED " + ex.GetType().Name);
+                                  Log(ex.ToString());
+                              }
+                          }
+                          Assembly game;
+                          if (loaded.TryGetValue("CastleMinerZ.exe", out game)) {
+                              try {
+                                  Type type = game.GetType("DNA.CastleMinerZ.CastleMinerZGame", true);
+                                  bool correctBase = typeof(Microsoft.Xna.Framework.Game).IsAssignableFrom(type);
+                                  Show("Actual game class linked to MonoGame: " + correctBase);
+                                  Log("Game constructors: " + string.Join("; ", type.GetConstructors().Select(c => c.ToString())));
+                              } catch (Exception ex) {
+                                  ex = Unwrap(ex);
+                                  Show("Actual game class: BLOCKED " + ex.GetType().Name);
+                                  Log(ex.ToString());
+                              }
+                          }
+                          Show("CHECK COMPLETE - game was NOT started; co-op is NOT implemented.");
+                          Show("Send this screen and LocalState/cmz-loader-log.txt.");
+                      } catch (Exception ex) {
+                          ex = Unwrap(ex);
+                          Show("CHECK STOPPED: " + ex.GetType().Name + ": " + ex.Message);
+                          Log(ex.ToString());
+                          Show("Send LocalState/cmz-loader-log.txt. Do not replace system runtime files.");
+                      }
+                      return string.Join("\n", summary);
+                  }
+                  private void Import(string zipPath, string destination)
+                  {
+                      var hashes = new Dictionary<string, string>(StringComparer.Ordinal) {
+                          { "CastleMinerZ.exe", "e378b91ed3c088e8d89094213e5eb064737957c05164ae84a22e4fc766f903a4" },
+                          { "DNA.Common.dll", "642853463e0bbdf310ee88956af41cb5c2db5814a12255674ed61e383f8b3d59" }
+                      };
+                      if (new FileInfo(zipPath).Length > 4 * 1024 * 1024)
+                          throw new InvalidDataException("Expected the small two-assembly ZIP, not an entire game archive.");
+                      using (var input = File.OpenRead(zipPath))
+                      using (var archive = new ZipArchive(input, ZipArchiveMode.Read)) {
+                          if (archive.Entries.Count != 2) throw new InvalidDataException("Expected exactly two original assemblies.");
+                          var seen = new HashSet<string>(StringComparer.Ordinal);
+                          foreach (var entry in archive.Entries) {
+                              string expected;
+                              if (!hashes.TryGetValue(entry.FullName, out expected) || !seen.Add(entry.FullName))
+                                  throw new InvalidDataException("Unexpected or duplicate ZIP entry: " + entry.FullName);
+                              long expectedLength = entry.FullName == "CastleMinerZ.exe" ? 439296 : 610304;
+                              if (entry.Length != expectedLength) throw new InvalidDataException("Original assembly size mismatch.");
+                              var bytes = new byte[(int)expectedLength];
+                              using (var stream = entry.Open()) {
+                                  int offset = 0;
+                                  while (offset < bytes.Length) {
+                                      int count = stream.Read(bytes, offset, bytes.Length - offset);
+                                      if (count == 0) throw new EndOfStreamException("Incomplete game assembly in ZIP.");
+                                      offset += count;
+                                  }
+                                  if (stream.ReadByte() != -1) throw new InvalidDataException("Oversized ZIP entry.");
+                              }
+                              string actual;
+                              using (var hash = SHA256.Create())
+                                  actual = BitConverter.ToString(hash.ComputeHash(bytes)).Replace("-", "").ToLowerInvariant();
+                              if (actual != expected) throw new InvalidDataException("Game assembly hash mismatch: " + entry.FullName);
+                              File.WriteAllBytes(Path.Combine(destination, entry.FullName), bytes);
+                              Log("Original verified: " + entry.FullName + " " + actual);
+                          }
+                      }
+                  }
+                  private void DiscoverContext()
+                  {
+                      Type type = typeof(object).Assembly.GetType("System.Runtime.Loader.AssemblyLoadContext");
+                      if (type == null || !type.IsPublic) throw new NotSupportedException("Public load context unavailable.");
+                      var property = type.GetProperty("Default", BindingFlags.Public | BindingFlags.Static);
+                      context = property == null ? null : property.GetValue(null);
+                      loadStream = type.GetMethod("LoadFromStream", BindingFlags.Public | BindingFlags.Instance,
+                          null, new Type[] { typeof(Stream) }, null);
+                      if (context == null || loadStream == null) throw new NotSupportedException("Public stream loading unavailable.");
+                      Log("Context: " + context.GetType().FullName);
+                  }
+                  private void AddProvider(Assembly assembly)
+                  {
+                      if (!providers.Contains(assembly)) providers.Add(assembly);
+                  }
+                  private Type RuntimeType(string name, bool xna)
+                  {
+                      string key = (xna ? "XNA:" : "BCL:") + name;
+                      Type type;
+                      if (typeCache.TryGetValue(key, out type)) return type;
+                      string full = name.Replace('/', '+');
+                      if (xna) type = typeof(Microsoft.Xna.Framework.Game).Assembly.GetType(full, false);
+                      else {
+                          type = Type.GetType(full, false);
+                          if (type == null) {
+                              foreach (var provider in providers) {
+                                  try { type = provider.GetType(full, false); }
+                                  catch { type = null; }
+                                  if (type != null) break;
+                              }
+                          }
+                      }
+                      if (type != null && !(type.IsPublic || type.IsNestedPublic)) type = null;
+                      typeCache[key] = type;
+                      return type;
+                  }
+                  private void Retarget(string original, string output)
+                  {
+                      using (var definition = AssemblyDefinition.ReadAssembly(original, new ReaderParameters {
+                          ReadingMode = ReadingMode.Deferred, ReadSymbols = false
+                      })) {
+                          var module = definition.MainModule;
+                          if ((module.Attributes & ModuleAttributes.ILOnly) == 0)
+                              throw new NotSupportedException("Only pure managed IL is accepted.");
+                          Log("Original " + Path.GetFileName(original) + " metadata " + module.RuntimeVersion);
+                          foreach (var reference in module.AssemblyReferences) Log("Assembly reference: " + reference.FullName);
+                          // Rewrite copies only. Unknown APIs remain unknown rather than being replaced with no-op stubs.
+                          foreach (TypeReference reference in module.GetTypeReferences().ToArray()) {
+                              TypeReference outer = reference;
+                              while (outer.DeclaringType != null) outer = outer.DeclaringType;
+                              var scope = outer.Scope as AssemblyNameReference;
+                              if (scope == null) continue;
+                              bool xna = scope.Name.StartsWith("Microsoft.Xna.Framework", StringComparison.Ordinal);
+                              bool bcl = scope.Name == "mscorlib" || scope.Name == "System" || scope.Name == "System.Core";
+                              if (!xna && !bcl) continue;
+                              Type type = RuntimeType(reference.FullName, xna);
+                              if (type == null) { unresolved.Add(scope.Name + " :: " + reference.FullName); continue; }
+                              var imported = module.ImportReference(type);
+                              reference.Scope = imported.Scope;
+                              mapped++;
+                          }
+                          // Original CF binary is IL-only; target the CLR metadata used by this experimental host.
+                          module.RuntimeVersion = "v4.0.30319";
+                          module.Attributes &= ~ModuleAttributes.Required32Bit;
+                          module.Attributes &= ~ModuleAttributes.Preferred32Bit;
+                          definition.Write(output);
+                          Log("Wrote retargeted app-local copy: " + Path.GetFileName(output));
+                      }
+                  }
+                  private void InspectTypes(string name, Assembly assembly)
+                  {
+                      try {
+                          var types = assembly.GetTypes();
+                          Show(name + ": " + types.Length + " types linked");
+                      } catch (ReflectionTypeLoadException ex) {
+                          int available = ex.Types.Count(t => t != null);
+                          Show(name + ": " + available + "/" + ex.Types.Length + " types linked; missing APIs in log");
+                          foreach (var error in ex.LoaderExceptions.Where(e => e != null)
+                              .Select(e => e.ToString()).Distinct()) Log("TYPE LOAD ERROR " + error);
+                      } catch (Exception ex) {
+                          Show(name + ": type inspection failed " + ex.GetType().Name);
+                          Log(ex.ToString());
+                      }
+                  }
+                  private static Exception Unwrap(Exception ex)
+                  {
+                      while (ex is TargetInvocationException && ex.InnerException != null) ex = ex.InnerException;
+                      return ex;
+                  }
+              }
+          }
+          ''', encoding='utf-8')
+
+          patch('ManagedProbe.csproj', '<Compile Include="ProbeTests.cs" />', '<Compile Include="CmzLoader.cs" />')
+          patch('ManagedProbe.csproj', '<Compile Include="NexiaFacadeFactory.cs" />', '')
+          patch('ManagedProbe.csproj', '<PackageReference Include="Mono.Cecil" Version="0.11.6" />',
+                '<PackageReference Include="Mono.Cecil" Version="0.11.6" />\n    <PackageReference Include="MonoGame.Framework.WindowsUniversal" Version="3.8.1.303" />')
+          license_url = 'https://raw.githubusercontent.com/MonoGame/MonoGame/v3.8.1/LICENSE.txt'
+          with urlopen(license_url, timeout=45) as response:
+              license_data = response.read()
+          blob = hashlib.sha1(b'blob ' + str(len(license_data)).encode('ascii') + b'\0' + license_data).hexdigest()
+          if blob != 'c2de72db5f3e88b27fdb32a7bdf3af11b66776bb':
+              raise RuntimeError('MonoGame license integrity mismatch')
+          (root / 'MONOGAME-LICENSE.txt').write_bytes(license_data)
+          patch('ManagedProbe.csproj', '<Content Include="NEXIA-LICENSE.txt" />',
+                '<Content Include="NEXIA-LICENSE.txt" /><Content Include="MONOGAME-LICENSE.txt" />')
+          patch('build.ps1', '    $mainManifest = Read-AppxManifest $package', r'''    $contentsCheck = [IO.Compression.ZipFile]::OpenRead($package)
+              try {
+                  foreach ($requiredFile in @('MonoGame.Framework.dll', 'Mono.Cecil.dll')) {
+                      if (!$contentsCheck.GetEntry($requiredFile)) { throw "Required assembly missing: $requiredFile" }
+                  }
+                  foreach ($entry in $contentsCheck.Entries) {
+                      if ($entry.FullName -match '(^|[/\\])(CastleMinerZ\.exe|DNA\.Common\.dll|CastleMinerZ-assemblies\.zip)$') {
+                          throw 'Original game files must not be in the public build artifact.'
+                      }
+                  }
+              } finally { $contentsCheck.Dispose() }
+              $mainManifest = Read-AppxManifest $package''')
+          patch('build.ps1', '    Copy-Item $package $out',
+                '    Copy-Item "$root\MONOGAME-LICENSE.txt" $out\n    Copy-Item $package $out')
+          patch('build.ps1', "    Write-Host 'BUILD PASSED. XBOX EXECUTION AND DYNAMIC IL SUPPORT REMAIN UNTESTED.'",
+                "    Write-Host 'CMZ ASSEMBLY LOADER BUILT. Real-game linking still needs testing; no gameplay or co-op is claimed.'")
+          notices = (root / 'THIRD-PARTY-NOTICES.txt').read_text(encoding='utf-8')
+          cecil_start = notices.index('Mono.Cecil 0.11.6 (NuGet)')
+          (root / 'THIRD-PARTY-NOTICES.txt').write_text(
+              'CMZ ASSEMBLY LOADER 0.5 - ORIGINAL EXPERIMENT CODE\n'
+              'No CastleMiner Z binary, asset or complete Nexia emulator is included.\n'
+              'Uses legacy MonoGame.Framework.WindowsUniversal 3.8.1.303.\n'
+              'See included MONOGAME-LICENSE.txt (Ms-PL and MIT). SharpDX packages use MIT.\n'
+              'No contributor or publisher endorsement is claimed.\n\n' + notices[cecil_start:], encoding='utf-8')
+          (root / 'README.txt').write_text('''CMZ ASSEMBLY LOADER 0.5 - NOT A PLAYABLE GAME
+
+          Next-stage real-assembly compatibility experiment. Not another cube scene.
+          No CastleMiner Z files are downloaded by this workflow or included in its output.
+          The input consists of the user's two original managed assemblies, with explicit
+          expected sizes and SHA-256 hashes. The input ZIP is kept unchanged.
+
+          After successful build/package inspection, install the new NexiaCMZLoader app
+          with its included dependencies. Keep all old probes and Xenia installed.
+          In Device Portal, upload CastleMinerZ-assemblies.zip to this new app's LocalState.
+          Keep the ZIP intact. Fully close and reopen CMZ Assembly Loader, set to Game.
+          The archive is read only by the app; exact names, sizes and hashes are checked.
+
+          It retargets resolvable CF/XNA type references to the runtime and stock MonoGame
+          in app-local COPIES, then attempts public LoadFromStream on DNA.Common and the
+          original game assembly. It reports missing framework names and type-load errors.
+          It intentionally does NOT call Program.Main or instantiate the game.
+          Type linking is not method/JIT validation, content conversion or gameplay.
+          Missing APIs remain missing: no silent no-op platform stubs are generated.
+
+          Send the resulting screen and LocalState/cmz-loader-log.txt. Copy the log before
+          relaunching: each launch resets it. There is no online service and no new OS
+          permission. A load/type error is diagnostic information, not a failed installation.
+
+          Couch co-op remains a project requirement: two controllers, two independent local
+          players, one shared world and separate player saves/HUDs. NOT implemented here.
+          The input contains no assets; a later gameplay host also needs the game's content.
+          No performance, avatar, split-screen or game-startup result is claimed.
+
+          At preparation: YAML, Python generation and XML are checked locally.
+          The new Windows build and actual game-assembly linking on Xbox are untested.
+          ''', encoding='utf-8')
+          print('Prepared CMZ original-assembly loader. No original game files are part of the cloud build.')
+
+      - name: Build and sign CMZ loader
+        shell: pwsh
+        env:
+          PROBE_BUILD_NUMBER: ${{ github.run_number }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tokens = $null
+          $parseErrors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            "$PWD/xbox-managed-probe/build.ps1", [ref]$tokens, [ref]$parseErrors
+          ) | Out-Null
+          if ($parseErrors.Count -gt 0) { throw ($parseErrors | Out-String) }
+          ./xbox-managed-probe/build.ps1 -BuildNumber ([int]$env:PROBE_BUILD_NUMBER)
+
+      - name: Upload signed loader or build logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: XboxCMZLoader-x64-${{ github.run_number }}
+          path: xbox-managed-probe/out/
+          retention-days: 7
+          if-no-files-found: warn
